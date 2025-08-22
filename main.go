@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +25,85 @@ const (
 	wsReadTimeout       = 60 * time.Second
 	proxyRequestTimeout = 600 * time.Second
 )
+
+// --- API Usage Statistics ---
+
+const statsFilename = "usage_stats.json"
+
+var (
+	// key: "modelName-YYYY-MM-DD", value: count
+	usageStats      = make(map[string]int64)
+	usageStatsMutex sync.RWMutex
+)
+
+// loadStats 从文件中加载统计数据
+func loadStats() {
+	usageStatsMutex.Lock()
+	defer usageStatsMutex.Unlock()
+
+	data, err := os.ReadFile(statsFilename)
+	if err != nil {
+		if os.IsNotExist(err) {
+			log.Println("统计文件不存在, 将创建一个新的。")
+			usageStats = make(map[string]int64)
+		} else {
+			log.Printf("加载统计文件时出错: %v", err)
+		}
+		return
+	}
+
+	if err := json.Unmarshal(data, &usageStats); err != nil {
+		log.Printf("解析统计文件时出错: %v", err)
+		// 如果文件损坏，则从一个空的map开始
+		usageStats = make(map[string]int64)
+	}
+	log.Printf("成功从 %s 加载了 %d 条统计记录。", statsFilename, len(usageStats))
+}
+
+// saveStats 将统计数据保存到文件
+func saveStats() {
+	usageStatsMutex.RLock()
+	// 复制map以最小化锁的持有时间
+	statsCopy := make(map[string]int64, len(usageStats))
+	for k, v := range usageStats {
+		statsCopy[k] = v
+	}
+	usageStatsMutex.RUnlock()
+
+	data, err := json.MarshalIndent(statsCopy, "", "  ")
+	if err != nil {
+		log.Printf("序列化统计数据时出错: %v", err)
+		return
+	}
+
+	// 原子写入：先写入临时文件，然后重命名
+	tempFilename := statsFilename + ".tmp"
+	if err := os.WriteFile(tempFilename, data, 0644); err != nil {
+		log.Printf("写入临时统计文件时出错: %v", err)
+		return
+	}
+	if err := os.Rename(tempFilename, statsFilename); err != nil {
+		log.Printf("重命名统计文件时出错: %v", err)
+	}
+	log.Printf("已将统计数据持久化到 %s", statsFilename)
+}
+
+// recordUsage increments the usage count for a given model.
+func recordUsage(modelName string) {
+	// Sanitize model name to avoid issues with path separators etc.
+	// e.g. "gemini-1.5-pro-latest"
+	if modelName == "" {
+		return
+	}
+	date := time.Now().UTC().Format("2006-01-02")
+	key := fmt.Sprintf("%s-%s", modelName, date)
+
+	usageStatsMutex.Lock()
+	defer usageStatsMutex.Unlock()
+
+	usageStats[key]++
+	log.Printf("Recorded usage for model %s. Total for today: %d", modelName, usageStats[key])
+}
 
 // --- Gemini API Structs ---
 
@@ -394,6 +474,21 @@ func forwardRequestToBrowser(w http.ResponseWriter, r *http.Request, userID stri
 // handleNativeGeminiProxy 处理原生的Gemini API请求
 func handleNativeGeminiProxy(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Received native Gemini request: Method=%s, Path=%s, From=%s", r.Method, r.URL.Path, r.RemoteAddr)
+
+	// 提取模型名称并记录使用情况
+	go func(path string) {
+		parts := strings.Split(path, "/")
+		for i, part := range parts {
+			if part == "models" && i+1 < len(parts) {
+				modelAndAction := parts[i+1]
+				modelNameParts := strings.Split(modelAndAction, ":")
+				if len(modelNameParts) > 0 {
+					recordUsage(modelNameParts[0])
+				}
+				return
+			}
+		}
+	}(r.URL.Path)
 
 	// 1. 使用专门为原生Gemini请求设计的宽松认证
 	userID, err := authenticateNativeRequest(r)
@@ -835,6 +930,9 @@ func handleOpenAIProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 记录模型使用情况
+	go recordUsage(openAIReq.Model)
+
 	geminiReq, err := convertOpenAIToGemini(&openAIReq)
 	if err != nil {
 		http.Error(w, "Failed to convert request: "+err.Error(), http.StatusInternalServerError)
@@ -1016,9 +1114,243 @@ func handleOpenAIProxy(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// --- API统计与前端展示 ---
+
+const statsHTML = `
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>API 使用统计</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; margin: 2em; background-color: #f4f4f9; color: #333; }
+        h1, h2 { color: #444; text-align: center; }
+        table { border-collapse: collapse; width: 100%; margin-top: 2em; box-shadow: 0 2px 5px rgba(0,0,0,0.1); background-color: #fff; }
+        th, td { border: 1px solid #ddd; padding: 12px 15px; text-align: left; }
+        th { background-color: #007bff; color: white; }
+        tr:nth-child(even) { background-color: #f2f2f2; }
+        tr:hover { background-color: #e9ecef; }
+        #charts-wrapper { display: flex; flex-wrap: wrap; gap: 2em; margin-bottom: 2em; }
+        .chart-container { flex: 1; min-width: 400px; height: 500px; background-color: #fff; box-shadow: 0 2px 5px rgba(0,0,0,0.1); border-radius: 8px; padding: 1em; }
+    </style>
+    <!-- 引入 ECharts -->
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+</head>
+<body>
+    <h1>API 使用统计</h1>
+    <p style="text-align: center;">数据每 5 秒自动刷新</p>
+
+    <!-- ECharts 图表容器 -->
+    <div id="charts-wrapper">
+        <div id="bar-chart-container" class="chart-container"></div>
+        <div id="pie-chart-container" class="chart-container"></div>
+    </div>
+
+    <h2>详细数据</h2>
+    <table id="stats-table">
+        <thead>
+            <tr>
+                <th>日期 (UTC)</th>
+                <th>模型名称</th>
+                <th>调用次数</th>
+            </tr>
+        </thead>
+        <tbody></tbody>
+    </table>
+
+    <script>
+        const barChartDom = document.getElementById('bar-chart-container');
+        const pieChartDom = document.getElementById('pie-chart-container');
+        const myBarChart = echarts.init(barChartDom);
+        const myPieChart = echarts.init(pieChartDom);
+
+        async function fetchStats() {
+            try {
+                const response = await fetch('/stats');
+                if (!response.ok) throw new Error('Network response was not ok');
+                const data = await response.json();
+
+                updateTable(data);
+                updateBarChart(data);
+                updatePieChart(data);
+
+            } catch (error) {
+                console.error('获取统计数据时出错:', error);
+                document.querySelector('#stats-table tbody').innerHTML = '<tr><td colspan="3">加载统计数据失败.</td></tr>';
+                myBarChart.showLoading('default', { text: '加载数据失败' });
+                myPieChart.showLoading('default', { text: '加载数据失败' });
+            }
+        }
+
+        function updateTable(data) {
+            const tableBody = document.querySelector('#stats-table tbody');
+            tableBody.innerHTML = '';
+            const stats = [];
+            for (const key in data) {
+                const parts = key.split('-');
+                const date = parts.slice(-3).join('-');
+                const model = parts.slice(0, -3).join('-');
+                stats.push({ date, model, count: data[key] });
+            }
+            stats.sort((a, b) => (b.date + a.model).localeCompare(a.date + b.model));
+
+            if (stats.length === 0) {
+                tableBody.innerHTML = '<tr><td colspan="3">暂无数据</td></tr>';
+            } else {
+                stats.forEach(stat => {
+                    const row = document.createElement('tr');
+                    row.innerHTML = ` + "`" + `<td>${stat.date}</td><td>${stat.model}</td><td>${stat.count}</td>` + "`" + `;
+                    tableBody.appendChild(row);
+                });
+            }
+        }
+
+        function updateBarChart(data) {
+            const allDates = new Set();
+            const allModels = new Set();
+            const processedData = {}; // { date: { model: count } }
+
+            for (const key in data) {
+                const parts = key.split('-');
+                const date = parts.slice(-3).join('-');
+                const model = parts.slice(0, -3).join('-');
+                allDates.add(date);
+                allModels.add(model);
+                if (!processedData[date]) processedData[date] = {};
+                processedData[date][model] = data[key];
+            }
+
+            const sortedDates = Array.from(allDates).sort((a, b) => a.localeCompare(b));
+            const sortedModels = Array.from(allModels).sort();
+
+            const series = sortedModels.map(model => ({
+                name: model,
+                type: 'bar',
+                stack: 'total',
+                emphasis: { focus: 'series' },
+                data: sortedDates.map(date => processedData[date][model] || 0)
+            }));
+
+            const option = {
+                title: { text: '每日模型调用量 (堆叠条形图)', left: 'center' },
+                tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
+                legend: { data: sortedModels, top: 'bottom' },
+                grid: { left: '3%', right: '4%', bottom: '10%', containLabel: true },
+                xAxis: [{ type: 'category', data: sortedDates }],
+                yAxis: [{ type: 'value' }],
+                series: series
+            };
+            
+            if (Object.keys(data).length === 0) {
+                 myBarChart.showLoading('default', { text: '暂无数据' });
+            } else {
+                myBarChart.hideLoading();
+                myBarChart.setOption(option);
+            }
+        }
+
+        function updatePieChart(data) {
+            const modelTotals = {};
+            for (const key in data) {
+                const parts = key.split('-');
+                const model = parts.slice(0, -3).join('-');
+                modelTotals[model] = (modelTotals[model] || 0) + data[key];
+            }
+
+            const pieData = Object.keys(modelTotals).map(model => ({
+                value: modelTotals[model],
+                name: model
+            }));
+
+            const option = {
+                title: { text: '模型总调用量占比 (饼图)', left: 'center' },
+                tooltip: { trigger: 'item', formatter: '{a} <br/>{b} : {c} ({d}%)' },
+                legend: { orient: 'vertical', left: 'left', data: Object.keys(modelTotals) },
+                series: [
+                    {
+                        name: '模型',
+                        type: 'pie',
+                        radius: '70%',
+                        center: ['50%', '60%'],
+                        data: pieData,
+                        emphasis: {
+                            itemStyle: {
+                                shadowBlur: 10,
+                                shadowOffsetX: 0,
+                                shadowColor: 'rgba(0, 0, 0, 0.5)'
+                            }
+                        }
+                    }
+                ]
+            };
+
+            if (pieData.length === 0) {
+                myPieChart.showLoading('default', { text: '暂无数据' });
+            } else {
+                myPieChart.hideLoading();
+                myPieChart.setOption(option);
+            }
+        }
+        
+        window.addEventListener('resize', () => {
+            myBarChart.resize();
+            myPieChart.resize();
+        });
+        
+        myBarChart.showLoading('default', { text: '正在加载数据...' });
+        myPieChart.showLoading('default', { text: '正在加载数据...' });
+        fetchStats();
+        setInterval(fetchStats, 5000);
+    </script>
+</body>
+</html>
+`
+
+// handleStatsUI 提供一个简单的前端页面来展示统计数据
+func handleStatsUI(w http.ResponseWriter, r *http.Request) {
+	// 如果是根路径以外的请求，返回404
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, statsHTML)
+}
+
+// handleStats 以JSON格式返回当前的API使用统计数据
+func handleStats(w http.ResponseWriter, r *http.Request) {
+	usageStatsMutex.RLock()
+	defer usageStatsMutex.RUnlock()
+
+	// 为了避免在JSON编码期间长时间持有锁，我们复制map
+	statsCopy := make(map[string]int64, len(usageStats))
+	for k, v := range usageStats {
+		statsCopy[k] = v
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(statsCopy); err != nil {
+		log.Printf("序列化统计数据时出错: %v", err)
+		http.Error(w, "无法序列化统计数据", http.StatusInternalServerError)
+	}
+}
+
 // --- 主函数 ---
 
 func main() {
+	// 加载持久化的统计数据
+	loadStats()
+
+	// 启动一个goroutine来定期保存统计数据
+	go func() {
+		ticker := time.NewTicker(1 * time.Minute) // 每分钟保存一次
+		defer ticker.Stop()
+		for range ticker.C {
+			saveStats()
+		}
+	}()
+
 	// 创建一个新的 ServeMux
 	mux := http.NewServeMux()
 
@@ -1032,6 +1364,11 @@ func main() {
 	// OpenAI 兼容路由
 	mux.HandleFunc("/v1/chat/completions", handleOpenAIProxy)
 	mux.HandleFunc("/v1/models", handleOpenAIModels)
+
+	// API 统计路由
+	mux.HandleFunc("/stats", handleStats)
+	// 统计前端页面路由
+	mux.HandleFunc("/", handleStatsUI)
 
 	// 将 CORS 中间件应用到所有 HTTP 路由
 	handler := corsMiddleware(mux)
