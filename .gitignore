@@ -57,3 +57,4 @@ profile.pprof         # Go CPU/Memory 性能分析文件
 
 # Windows 特定
 Thumbs.db
+/.idea/

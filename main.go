@@ -1,12 +1,16 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,6 +25,118 @@ const (
 	wsReadTimeout       = 60 * time.Second
 	proxyRequestTimeout = 600 * time.Second
 )
+
+// --- Gemini API Structs ---
+
+type GeminiPart struct {
+	Text       string      `json:"text,omitempty"`
+	InlineData *InlineData `json:"inline_data,omitempty"`
+}
+
+type InlineData struct {
+	MimeType string `json:"mime_type"`
+	Data     string `json:"data"`
+}
+
+type GeminiContent struct {
+	Role  string       `json:"role"`
+	Parts []GeminiPart `json:"parts"`
+}
+
+type GenerationConfig struct {
+	Temperature     float64  `json:"temperature,omitempty"`
+	TopP            float64  `json:"topP,omitempty"`
+	MaxOutputTokens int      `json:"maxOutputTokens,omitempty"`
+	StopSequences   []string `json:"stopSequences,omitempty"`
+}
+
+type GeminiRequest struct {
+	Contents         []GeminiContent   `json:"contents"`
+	GenerationConfig *GenerationConfig `json:"generationConfig,omitempty"`
+}
+
+type GeminiCandidate struct {
+	Content      GeminiContent `json:"content"`
+	FinishReason string        `json:"finishReason"`
+}
+
+type UsageMetadata struct {
+	PromptTokenCount     int `json:"promptTokenCount"`
+	CandidatesTokenCount int `json:"candidatesTokenCount"`
+	TotalTokenCount      int `json:"totalTokenCount"`
+}
+
+type GeminiResponse struct {
+	Candidates    []GeminiCandidate `json:"candidates"`
+	UsageMetadata UsageMetadata     `json:"usageMetadata"`
+}
+
+// GeminiModelInfo describes a single model from the Gemini API
+type GeminiModelInfo struct {
+	Name        string `json:"name"`
+	DisplayName string `json:"displayName"`
+}
+
+// GeminiModelListResponse is the response from the Gemini list models API
+type GeminiModelListResponse struct {
+	Models []GeminiModelInfo `json:"models"`
+}
+
+// --- OpenAI API Structs ---
+
+type OpenAIMessage struct {
+	Role    string      `json:"role"`
+	Content interface{} `json:"content"` // Can be string or []OpenAIPart
+}
+
+type OpenAIPart struct {
+	Type     string          `json:"type"`
+	Text     string          `json:"text,omitempty"`
+	ImageURL *OpenAIImageURL `json:"image_url,omitempty"`
+}
+
+type OpenAIImageURL struct {
+	URL string `json:"url"`
+}
+
+type OpenAIRequest struct {
+	Model       string          `json:"model"`
+	Messages    []OpenAIMessage `json:"messages"`
+	Stream      bool            `json:"stream"`
+	Temperature float64         `json:"temperature"`
+	TopP        float64         `json:"top_p"`
+	MaxTokens   int             `json:"max_tokens"`
+	Stop        []string        `json:"stop"`
+}
+
+type OpenAIChoice struct {
+	Index        int           `json:"index"`
+	Message      OpenAIMessage `json:"message"`
+	FinishReason string        `json:"finish_reason"`
+}
+
+type OpenAIResponse struct {
+	ID      string         `json:"id"`
+	Object  string         `json:"object"`
+	Created int64          `json:"created"`
+	Model   string         `json:"model"`
+	Choices []OpenAIChoice `json:"choices"`
+	Usage   UsageMetadata  `json:"usage"`
+}
+
+type OpenAIStreamChoice struct {
+	Index        int           `json:"index"`
+	Delta        OpenAIMessage `json:"delta"`
+	FinishReason *string       `json:"finish_reason"`
+}
+
+type OpenAIStreamResponse struct {
+	ID      string               `json:"id"`
+	Object  string               `json:"object"`
+	Created int64                `json:"created"`
+	Model   string               `json:"model"`
+	Choices []OpenAIStreamChoice `json:"choices"`
+}
 
 // --- 1. 连接管理与负载均衡 ---
 
@@ -250,24 +366,14 @@ func readPump(uc *UserConnection) {
 
 // --- 4. HTTP 反向代理与 WS 隧道 ---
 
-func handleProxyRequest(w http.ResponseWriter, r *http.Request) {
-	// 1. 认证并获取UserID (这里模拟)
-	userID, err := authenticateHTTPRequest(r)
-	if err != nil {
-		http.Error(w, "Proxy authentication failed", http.StatusUnauthorized)
-		return
-	}
-
-	// 2. 生成唯一请求ID
-	reqID := uuid.NewString()
-
-	// 3. 创建响应通道并注册
-	// 使用带缓冲的通道以适应流式响应块
+// forwardRequestToBrowser 封装了将请求通过WebSocket转发给浏览器的核心逻辑
+func forwardRequestToBrowser(w http.ResponseWriter, r *http.Request, userID string, wsPayload WSMessage) {
+	// 1. 创建响应通道并注册
 	respChan := make(chan *WSMessage, 10)
-	pendingRequests.Store(reqID, respChan)
-	defer pendingRequests.Delete(reqID) // 确保请求结束后清理
+	pendingRequests.Store(wsPayload.ID, respChan)
+	defer pendingRequests.Delete(wsPayload.ID)
 
-	// 4. 选择一个WebSocket连接
+	// 2. 选择一个WebSocket连接
 	selectedConn, err := globalPool.GetConnection(userID)
 	if err != nil {
 		log.Printf("Error getting connection for user %s: %v", userID, err)
@@ -275,7 +381,30 @@ func handleProxyRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 5. 封装HTTP请求为WS消息
+	// 3. 发送请求到WebSocket客户端
+	if err := selectedConn.safeWriteJSON(wsPayload); err != nil {
+		log.Printf("Failed to send request over WebSocket: %v", err)
+		http.Error(w, "Bad Gateway: Failed to send request to client", http.StatusBadGateway)
+		return
+	}
+
+	// 4. 异步等待并处理响应
+	processWebSocketResponse(w, r, respChan)
+}
+
+// handleNativeGeminiProxy 处理原生的Gemini API请求
+func handleNativeGeminiProxy(w http.ResponseWriter, r *http.Request) {
+	log.Printf("Received native Gemini request: Method=%s, Path=%s, From=%s", r.Method, r.URL.Path, r.RemoteAddr)
+
+	// 1. 使用专门为原生Gemini请求设计的宽松认证
+	userID, err := authenticateNativeRequest(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	// 2. 准备WebSocket消息
+	reqID := uuid.NewString()
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "Failed to read request body", http.StatusInternalServerError)
@@ -283,37 +412,28 @@ func handleProxyRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
-	// 注意：将Header直接序列化为JSON可能需要一些处理，这里简化处理
-	// 对于生产环境，可能需要更精细的Header转换
 	headers := make(map[string][]string)
 	for k, v := range r.Header {
-		// 过滤掉一些HTTP/1.1特有的或代理不应转发的头
+		// 过滤掉一些不应转发的头
 		if k != "Connection" && k != "Keep-Alive" && k != "Proxy-Authenticate" && k != "Proxy-Authorization" && k != "Te" && k != "Trailers" && k != "Transfer-Encoding" && k != "Upgrade" {
 			headers[k] = v
 		}
 	}
+	// 对于原生请求，我们不再强制覆盖API Key，让浏览器客户端自行处理
 
 	requestPayload := WSMessage{
 		ID:   reqID,
 		Type: "http_request",
 		Payload: map[string]interface{}{
-			"method": r.Method,
-			// 假设前端知道如何处理这个相对URL，或者您在这里构建完整的外部URL
+			"method":  r.Method,
 			"url":     "https://generativelanguage.googleapis.com" + r.URL.String(),
 			"headers": headers,
-			"body":    string(bodyBytes), // 对于二进制数据，应使用base64编码
+			"body":    string(bodyBytes),
 		},
 	}
 
-	// 6. 发送请求到WebSocket客户端
-	if err := selectedConn.safeWriteJSON(requestPayload); err != nil {
-		log.Printf("Failed to send request over WebSocket: %v", err)
-		http.Error(w, "Bad Gateway: Failed to send request to client", http.StatusBadGateway)
-		return
-	}
-
-	// 7. 异步等待并处理响应
-	processWebSocketResponse(w, r, respChan)
+	// 3. 调用核心转发逻辑
+	forwardRequestToBrowser(w, r, userID, requestPayload)
 }
 
 // processWebSocketResponse 处理来自WS通道的响应，构建HTTP响应
@@ -489,35 +609,388 @@ func validateJWT(token string) (string, error) {
 	return "", errors.New("invalid token")
 }
 
-// authenticateHTTPRequest 模拟HTTP代理请求的认证
-func authenticateHTTPRequest(r *http.Request) (string, error) {
-	// 实际应用中，可能检查Authorization头或其他API Key
-	//apiKey := r.Header.Get("x-goog-api-key")
-	//if apiKey == "secret-key-for-user-1" {
-	//	return "user-1", nil
-	//}
-	//if apiKey == "secret-key-for-user-2" {
-	//	return "user-2", nil
-	//}
-	//// 也可以从请求路径中获取 /proxy/user-1/...
-	//return "", errors.New("invalid API key")
+// authenticateNativeRequest 模拟HTTP代理请求的认证,不强制要求API Key
+func authenticateNativeRequest(r *http.Request) (string, error) {
+	// 对于原生Gemini请求，我们不在代理层面强制执行密钥检查。
+	// 浏览器客户端（扩展）应该自己处理身份验证。
+	// 我们只分配一个用户ID用于路由。
 	return "user-1", nil
+}
+
+// authenticateAndGetGoogleKey 负责认证并返回应该用于请求Google的API密钥
+func authenticateAndGetGoogleKey(r *http.Request) (userID, googleAPIKey string, err error) {
+	// 1. 从所有可能的位置提取客户端提供的API Key
+	clientAPIKey := r.Header.Get("x-goog-api-key")
+	if clientAPIKey == "" {
+		clientAPIKey = r.URL.Query().Get("key")
+	}
+	if clientAPIKey == "" {
+		authHeader := r.Header.Get("Authorization")
+		if strings.HasPrefix(authHeader, "Bearer ") {
+			clientAPIKey = strings.TrimPrefix(authHeader, "Bearer ")
+		}
+	}
+
+	// 2. 从环境变量中获取代理的认证密钥
+	// 认证逻辑已禁用. 直接使用客户端提供的密钥.
+	if clientAPIKey == "" {
+		return "", "", errors.New("API key not found in request")
+	}
+	return "user-1", clientAPIKey, nil
+}
+
+// --- CORS 中间件 ---
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 设置允许跨域的响应头
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
+		w.Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, x-goog-api-key")
+
+		// 如果是预检请求 (OPTIONS)，则直接返回
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		// 否则，继续处理请求
+		next.ServeHTTP(w, r)
+	})
+}
+
+// --- Conversion Logic ---
+
+func convertOpenAIToGemini(req *OpenAIRequest) (*GeminiRequest, error) {
+	geminiContents := []GeminiContent{}
+	for _, msg := range req.Messages {
+		var role string
+		if msg.Role == "assistant" {
+			role = "model"
+		} else {
+			// OpenAI's "system" role is treated as a "user" role in Gemini's alternating structure
+			role = "user"
+		}
+
+		var parts []GeminiPart
+		switch content := msg.Content.(type) {
+		case string:
+			parts = append(parts, GeminiPart{Text: content})
+		case []interface{}:
+			for _, p := range content {
+				partMap, ok := p.(map[string]interface{})
+				if !ok {
+					return nil, errors.New("invalid content part format")
+				}
+				partType, _ := partMap["type"].(string)
+				if partType == "text" {
+					text, _ := partMap["text"].(string)
+					parts = append(parts, GeminiPart{Text: text})
+				} else if partType == "image_url" {
+					imageURLMap, _ := partMap["image_url"].(map[string]interface{})
+					url, _ := imageURLMap["url"].(string)
+					// Handle base64 encoded images
+					if strings.HasPrefix(url, "data:image/") {
+						parts = append(parts, GeminiPart{
+							InlineData: &InlineData{
+								MimeType: strings.Split(strings.Split(url, ";")[0], ":")[1],
+								Data:     strings.Split(url, ",")[1],
+							},
+						})
+					}
+				}
+			}
+		}
+		// Ensure we don't add empty content
+		if len(parts) > 0 {
+			geminiContents = append(geminiContents, GeminiContent{Role: role, Parts: parts})
+		}
+	}
+
+	// Gemini requires the conversation to start with a "user" role.
+	// If the first message is not from the user, we should probably return an error.
+	if len(geminiContents) > 0 && geminiContents[0].Role != "user" {
+		// Or prepend an empty user message, depending on desired behavior.
+		// For now, let's assume valid input.
+	}
+
+	geminiReq := &GeminiRequest{
+		Contents: geminiContents,
+		GenerationConfig: &GenerationConfig{
+			Temperature:     req.Temperature,
+			TopP:            req.TopP,
+			MaxOutputTokens: req.MaxTokens,
+			StopSequences:   req.Stop,
+		},
+	}
+	return geminiReq, nil
+}
+
+func convertGeminiToOpenAI(geminiResp *GeminiResponse, model string) *OpenAIResponse {
+	choices := []OpenAIChoice{}
+	for i, candidate := range geminiResp.Candidates {
+		choices = append(choices, OpenAIChoice{
+			Index: i,
+			Message: OpenAIMessage{
+				Role:    "assistant",
+				Content: candidate.Content.Parts[0].Text,
+			},
+			FinishReason: candidate.FinishReason,
+		})
+	}
+
+	return &OpenAIResponse{
+		ID:      "chatcmpl-" + uuid.NewString(),
+		Object:  "chat.completion",
+		Created: time.Now().Unix(),
+		Model:   model,
+		Choices: choices,
+		Usage:   geminiResp.UsageMetadata,
+	}
+}
+
+func convertGeminiModelListToOpenAI(geminiResp *GeminiModelListResponse) map[string]interface{} {
+	data := []map[string]interface{}{}
+	for _, model := range geminiResp.Models {
+		// Extract the model ID from the full name, e.g., "models/gemini-1.5-pro-latest" -> "gemini-1.5-pro-latest"
+		modelID := model.Name
+		if parts := strings.Split(model.Name, "/"); len(parts) == 2 {
+			modelID = parts[1]
+		}
+		data = append(data, map[string]interface{}{
+			"id":       modelID,
+			"object":   "model",
+			"owned_by": "google",
+		})
+	}
+
+	return map[string]interface{}{
+		"object": "list",
+		"data":   data,
+	}
+}
+
+// --- HTTP Handlers for OpenAI Compatibility ---
+
+func handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
+	log.Println("Received OpenAI compatible models list request")
+
+	// --- Authenticate the request and get the key for Google ---
+	// We use the same authentication as the chat proxy, as the client should provide a key
+	userID, googleAPIKey, err := authenticateAndGetGoogleKey(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	// --- Prepare payload for WebSocket ---
+	headers := make(map[string][]string)
+	for k, v := range r.Header {
+		headers[k] = v
+	}
+	headers["x-goog-api-key"] = []string{googleAPIKey}
+
+	wsPayload := WSMessage{
+		ID:   uuid.NewString(),
+		Type: "http_request",
+		Payload: map[string]interface{}{
+			"method":  "GET",
+			"url":     "https://generativelanguage.googleapis.com/v1beta/models",
+			"headers": headers,
+			"body":    "", // No body for GET request
+		},
+	}
+
+	// --- Use a ResponseRecorder to capture the output of the core logic ---
+	recorder := httptest.NewRecorder()
+
+	// Directly call the core logic that talks to the browser
+	forwardRequestToBrowser(recorder, r, userID, wsPayload)
+
+	// --- Process and convert the response back ---
+	if recorder.Code != http.StatusOK {
+		// If the proxy logic returned an error, forward it
+		w.WriteHeader(recorder.Code)
+		w.Write(recorder.Body.Bytes())
+		return
+	}
+
+	// Handle non-streaming response
+	var geminiResp GeminiModelListResponse
+	if err := json.NewDecoder(recorder.Body).Decode(&geminiResp); err != nil {
+		http.Error(w, "Failed to decode gemini models response: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	openAIResp := convertGeminiModelListToOpenAI(&geminiResp)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(openAIResp)
+}
+
+func handleOpenAIProxy(w http.ResponseWriter, r *http.Request) {
+	log.Println("Received OpenAI compatible request")
+
+	var openAIReq OpenAIRequest
+	if err := json.NewDecoder(r.Body).Decode(&openAIReq); err != nil {
+		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	geminiReq, err := convertOpenAIToGemini(&openAIReq)
+	if err != nil {
+		http.Error(w, "Failed to convert request: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// --- Authenticate the request and get the key for Google ---
+	userID, googleAPIKey, err := authenticateAndGetGoogleKey(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	// --- Prepare payload for WebSocket ---
+	geminiReqBytes, err := json.Marshal(geminiReq)
+	if err != nil {
+		http.Error(w, "Failed to marshal gemini request", http.StatusInternalServerError)
+		return
+	}
+
+	// The URL in the payload for the browser does not depend on the original request URL,
+	// so we can construct a generic one.
+	modelToUse := openAIReq.Model
+	if modelToUse == "" {
+		modelToUse = "gemini-1.5-pro-latest" // Default model
+	}
+	action := "generateContent"
+	if openAIReq.Stream {
+		action = "streamGenerateContent"
+	}
+
+	// Forward all headers from the original request, but ensure the correct API key is set
+	headers := make(map[string][]string)
+	for k, v := range r.Header {
+		headers[k] = v
+	}
+	headers["x-goog-api-key"] = []string{googleAPIKey}
+
+	wsPayload := WSMessage{
+		ID:   uuid.NewString(),
+		Type: "http_request",
+		Payload: map[string]interface{}{
+			"method":  "POST",
+			"url":     "https://generativelanguage.googleapis.com/v1beta/models/" + modelToUse + ":" + action,
+			"headers": headers,
+			"body":    string(geminiReqBytes),
+		},
+	}
+
+	// --- Use a ResponseRecorder to capture the output of the core logic ---
+	recorder := httptest.NewRecorder()
+
+	// Directly call the core logic that talks to the browser
+	forwardRequestToBrowser(recorder, r, userID, wsPayload)
+
+	// --- Process and convert the response back ---
+	if recorder.Code != http.StatusOK {
+		// If the proxy logic returned an error, forward it
+		w.WriteHeader(recorder.Code)
+		w.Write(recorder.Body.Bytes())
+		return
+	}
+
+	if openAIReq.Stream {
+		// For streaming, we need to handle the response differently.
+		// The recorder.Body is an io.Reader that we can process.
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+
+		scanner := bufio.NewScanner(recorder.Body)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.HasPrefix(line, "data: ") {
+				jsonData := strings.TrimPrefix(line, "data: ")
+				var geminiResp GeminiResponse
+				if err := json.Unmarshal([]byte(jsonData), &geminiResp); err != nil {
+					log.Printf("Error unmarshalling stream chunk: %v", err)
+					continue
+				}
+
+				if len(geminiResp.Candidates) > 0 && len(geminiResp.Candidates[0].Content.Parts) > 0 {
+					openAIChunk := OpenAIStreamResponse{
+						ID:      "chatcmpl-" + uuid.NewString(),
+						Object:  "chat.completion.chunk",
+						Created: time.Now().Unix(),
+						Model:   modelToUse,
+						Choices: []OpenAIStreamChoice{
+							{
+								Index: 0,
+								Delta: OpenAIMessage{
+									Role:    "assistant",
+									Content: geminiResp.Candidates[0].Content.Parts[0].Text,
+								},
+							},
+						},
+					}
+					chunkBytes, err := json.Marshal(openAIChunk)
+					if err != nil {
+						log.Printf("Error marshalling OpenAI chunk: %v", err)
+						continue
+					}
+					fmt.Fprintf(w, "data: %s\n\n", chunkBytes)
+					if flusher, ok := w.(http.Flusher); ok {
+						flusher.Flush()
+					}
+				}
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			log.Printf("Error reading from stream: %v", err)
+		}
+		// Send the done message
+		fmt.Fprintf(w, "data: [DONE]\n\n")
+
+	} else {
+		// Handle non-streaming response
+		var geminiResp GeminiResponse
+		if err := json.NewDecoder(recorder.Body).Decode(&geminiResp); err != nil {
+			http.Error(w, "Failed to decode gemini response: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		openAIResp := convertGeminiToOpenAI(&geminiResp, openAIReq.Model)
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(openAIResp)
+	}
 }
 
 // --- 主函数 ---
 
 func main() {
-	// WebSocket 路由
-	http.HandleFunc(wsPath, handleWebSocket)
+	// 创建一个新的 ServeMux
+	mux := http.NewServeMux()
 
-	// HTTP 反向代理路由 (捕获所有其他请求)
-	http.HandleFunc("/", handleProxyRequest)
+	// WebSocket 路由 (通常不需要CORS)
+	mux.HandleFunc(wsPath, handleWebSocket)
+
+	// HTTP 反向代理路由
+	mux.HandleFunc("/v1beta/", handleNativeGeminiProxy)
+	mux.HandleFunc("/v1/", handleNativeGeminiProxy) // 兼容v1
+
+	// OpenAI 兼容路由
+	mux.HandleFunc("/v1/chat/completions", handleOpenAIProxy)
+	mux.HandleFunc("/v1/models", handleOpenAIModels)
+
+	// 将 CORS 中间件应用到所有 HTTP 路由
+	handler := corsMiddleware(mux)
 
 	log.Printf("Starting server on %s", proxyListenAddr)
 	log.Printf("WebSocket endpoint available at ws://%s%s", proxyListenAddr, wsPath)
 	log.Printf("HTTP proxy available at http://%s/", proxyListenAddr)
 
-	if err := http.ListenAndServe(proxyListenAddr, nil); err != nil {
+	if err := http.ListenAndServe(proxyListenAddr, handler); err != nil {
 		log.Fatalf("Could not start server: %s\n", err)
 	}
 }
