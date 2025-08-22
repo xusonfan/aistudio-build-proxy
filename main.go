@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -885,74 +884,126 @@ func handleOpenAIProxy(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	// --- Use a ResponseRecorder to capture the output of the core logic ---
-	recorder := httptest.NewRecorder()
-
-	// Directly call the core logic that talks to the browser
-	forwardRequestToBrowser(recorder, r, userID, wsPayload)
-
-	// --- Process and convert the response back ---
-	if recorder.Code != http.StatusOK {
-		// If the proxy logic returned an error, forward it
-		w.WriteHeader(recorder.Code)
-		w.Write(recorder.Body.Bytes())
-		return
-	}
-
 	if openAIReq.Stream {
-		// For streaming, we need to handle the response differently.
-		// The recorder.Body is an io.Reader that we can process.
+		// For streaming, we handle the response asynchronously without a recorder.
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "Streaming unsupported!", http.StatusInternalServerError)
+			return
+		}
 
-		scanner := bufio.NewScanner(recorder.Body)
-		for scanner.Scan() {
-			line := scanner.Text()
-			if strings.HasPrefix(line, "data: ") {
-				jsonData := strings.TrimPrefix(line, "data: ")
-				var geminiResp GeminiResponse
-				if err := json.Unmarshal([]byte(jsonData), &geminiResp); err != nil {
-					log.Printf("Error unmarshalling stream chunk: %v", err)
-					continue
+		// This part is similar to forwardRequestToBrowser, but we handle the response asynchronously.
+		respChan := make(chan *WSMessage, 10)
+		pendingRequests.Store(wsPayload.ID, respChan)
+		defer pendingRequests.Delete(wsPayload.ID)
+
+		selectedConn, err := globalPool.GetConnection(userID)
+		if err != nil {
+			http.Error(w, "Service Unavailable: No active client connected", http.StatusServiceUnavailable)
+			return
+		}
+
+		if err := selectedConn.safeWriteJSON(wsPayload); err != nil {
+			http.Error(w, "Bad Gateway: Failed to send request to client", http.StatusBadGateway)
+			return
+		}
+
+		// Asynchronous response processing loop.
+		ctx, cancel := context.WithTimeout(r.Context(), proxyRequestTimeout)
+		defer cancel()
+
+		for {
+			select {
+			case msg, ok := <-respChan:
+				if !ok {
+					// Channel closed, stream is done.
+					fmt.Fprintf(w, "data: [DONE]\n\n")
+					flusher.Flush()
+					return
 				}
 
-				if len(geminiResp.Candidates) > 0 && len(geminiResp.Candidates[0].Content.Parts) > 0 {
-					openAIChunk := OpenAIStreamResponse{
-						ID:      "chatcmpl-" + uuid.NewString(),
-						Object:  "chat.completion.chunk",
-						Created: time.Now().Unix(),
-						Model:   modelToUse,
-						Choices: []OpenAIStreamChoice{
-							{
-								Index: 0,
-								Delta: OpenAIMessage{
-									Role:    "assistant",
-									Content: geminiResp.Candidates[0].Content.Parts[0].Text,
-								},
-							},
-						},
-					}
-					chunkBytes, err := json.Marshal(openAIChunk)
-					if err != nil {
-						log.Printf("Error marshalling OpenAI chunk: %v", err)
+				switch msg.Type {
+				case "stream_chunk":
+					var bodyStr string
+					// The raw JSON data from Gemini is in the 'data' field of the payload.
+					if data, ok := msg.Payload["data"].(string); ok {
+						bodyStr = data
+					} else {
 						continue
 					}
-					fmt.Fprintf(w, "data: %s\n\n", chunkBytes)
-					if flusher, ok := w.(http.Flusher); ok {
+
+					// The browser client might forward the raw SSE line, including "data: ".
+					// We need to trim it before parsing.
+					if strings.HasPrefix(bodyStr, "data: ") {
+						bodyStr = strings.TrimPrefix(bodyStr, "data: ")
+					}
+
+					var geminiResp GeminiResponse
+					if err := json.Unmarshal([]byte(bodyStr), &geminiResp); err != nil {
+						log.Printf("Error unmarshalling stream chunk from WS payload: %v", err)
+						continue
+					}
+
+					if len(geminiResp.Candidates) > 0 && len(geminiResp.Candidates[0].Content.Parts) > 0 {
+						openAIChunk := OpenAIStreamResponse{
+							ID:      "chatcmpl-" + uuid.NewString(),
+							Object:  "chat.completion.chunk",
+							Created: time.Now().Unix(),
+							Model:   modelToUse,
+							Choices: []OpenAIStreamChoice{
+								{
+									Index: 0,
+									Delta: OpenAIMessage{
+										Role:    "assistant",
+										Content: geminiResp.Candidates[0].Content.Parts[0].Text,
+									},
+								},
+							},
+						}
+						chunkBytes, err := json.Marshal(openAIChunk)
+						if err != nil {
+							log.Printf("Error marshalling OpenAI chunk: %v", err)
+							continue
+						}
+						fmt.Fprintf(w, "data: %s\n\n", chunkBytes)
 						flusher.Flush()
 					}
+
+				case "stream_end":
+					fmt.Fprintf(w, "data: [DONE]\n\n")
+					flusher.Flush()
+					return
+
+				case "error":
+					log.Printf("Received error from client during stream: %v", msg.Payload)
+					// We can't send an HTTP error now, so we just terminate the stream.
+					fmt.Fprintf(w, "data: [DONE]\n\n")
+					flusher.Flush()
+					return
 				}
+
+			case <-ctx.Done():
+				log.Printf("Gateway Timeout: Stream incomplete for request %s", r.URL.Path)
+				// Terminate the stream on timeout.
+				fmt.Fprintf(w, "data: [DONE]\n\n")
+				flusher.Flush()
+				return
 			}
 		}
-		if err := scanner.Err(); err != nil {
-			log.Printf("Error reading from stream: %v", err)
-		}
-		// Send the done message
-		fmt.Fprintf(w, "data: [DONE]\n\n")
-
 	} else {
-		// Handle non-streaming response
+		// For non-streaming, the original recorder logic is correct.
+		recorder := httptest.NewRecorder()
+		forwardRequestToBrowser(recorder, r, userID, wsPayload)
+
+		if recorder.Code != http.StatusOK {
+			w.WriteHeader(recorder.Code)
+			w.Write(recorder.Body.Bytes())
+			return
+		}
+
 		var geminiResp GeminiResponse
 		if err := json.NewDecoder(recorder.Body).Decode(&geminiResp); err != nil {
 			http.Error(w, "Failed to decode gemini response: "+err.Error(), http.StatusInternalServerError)
@@ -960,7 +1011,6 @@ func handleOpenAIProxy(w http.ResponseWriter, r *http.Request) {
 		}
 
 		openAIResp := convertGeminiToOpenAI(&geminiResp, openAIReq.Model)
-
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(openAIResp)
 	}
