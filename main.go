@@ -105,6 +105,22 @@ func recordUsage(modelName string) {
 	log.Printf("Recorded usage for model %s. Total for today: %d", modelName, usageStats[key])
 }
 
+// recordErrorRequest 记录一个非200的HTTP请求
+func recordErrorRequest(statusCode int) {
+	// 我们记录任何非200 OK的状态码
+	if statusCode == http.StatusOK {
+		return
+	}
+	date := time.Now().UTC().Format("2006-01-02")
+	key := fmt.Sprintf("error-status-%d-%s", statusCode, date)
+
+	usageStatsMutex.Lock()
+	defer usageStatsMutex.Unlock()
+
+	usageStats[key]++
+	log.Printf("记录到非200请求: StatusCode=%d. 今日总计: %d", statusCode, usageStats[key])
+}
+
 // --- Gemini API Structs ---
 
 type GeminiPart struct {
@@ -336,6 +352,25 @@ func (p *ConnectionPool) GetConnection(userID string) (*UserConnection, error) {
 	return selectedConn, nil
 }
 
+// GetAllConnections 获取用户的所有活动连接
+func (p *ConnectionPool) GetAllConnections(userID string) []*UserConnection {
+	p.RLock()
+	userConns, exists := p.Users[userID]
+	p.RUnlock()
+
+	if !exists {
+		return nil
+	}
+
+	userConns.Lock()
+	defer userConns.Unlock()
+
+	// 返回连接切片的副本以确保线程安全
+	connsCopy := make([]*UserConnection, len(userConns.Connections))
+	copy(connsCopy, userConns.Connections)
+	return connsCopy
+}
+
 // --- 2. WebSocket 消息结构 & 待处理请求 ---
 
 // WSMessage 是前后端之间通信的基本结构
@@ -364,6 +399,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	userID, err := validateJWT(authToken)
 	if err != nil {
 		log.Printf("WebSocket authentication failed: %v", err)
+		recordErrorRequest(http.StatusUnauthorized)
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -446,53 +482,97 @@ func readPump(uc *UserConnection) {
 // --- 4. HTTP 反向代理与 WS 隧道 ---
 
 // forwardRequestToBrowser 封装了将请求通过WebSocket转发给浏览器的核心逻辑
-func forwardRequestToBrowser(w http.ResponseWriter, r *http.Request, userID string, wsPayload WSMessage) {
-	// 1. 创建响应通道并注册
-	respChan := make(chan *WSMessage, 10)
-	pendingRequests.Store(wsPayload.ID, respChan)
-	defer pendingRequests.Delete(wsPayload.ID)
-
-	// 2. 选择一个WebSocket连接
-	selectedConn, err := globalPool.GetConnection(userID)
-	if err != nil {
-		log.Printf("Error getting connection for user %s: %v", userID, err)
+func forwardRequestToBrowser(w http.ResponseWriter, r *http.Request, userID string, wsPayload WSMessage, modelName string) {
+	allConns := globalPool.GetAllConnections(userID)
+	if len(allConns) == 0 {
+		log.Printf("No connections available for user %s", userID)
+		recordErrorRequest(http.StatusServiceUnavailable)
 		http.Error(w, "Service Unavailable: No active client connected", http.StatusServiceUnavailable)
 		return
 	}
 
-	// 3. 发送请求到WebSocket客户端
-	if err := selectedConn.safeWriteJSON(wsPayload); err != nil {
-		log.Printf("Failed to send request over WebSocket: %v", err)
-		http.Error(w, "Bad Gateway: Failed to send request to client", http.StatusBadGateway)
-		return
+	var lastError error
+
+	for i, conn := range allConns {
+		log.Printf("Attempting request %s on connection %d/%d for user %s", wsPayload.ID, i+1, len(allConns), userID)
+		respChan := make(chan *WSMessage, 10)
+		pendingRequests.Store(wsPayload.ID, respChan)
+
+		if err := conn.safeWriteJSON(wsPayload); err != nil {
+			log.Printf("Failed to send request over WebSocket on attempt %d: %v", i+1, err)
+			lastError = err
+			pendingRequests.Delete(wsPayload.ID) // 清理
+			continue                             // 尝试下一个连接
+		}
+
+		// 等待初始响应
+		ctx, cancel := context.WithTimeout(r.Context(), proxyRequestTimeout)
+		select {
+		case msg := <-respChan:
+			// 检查是否是成功的初始消息
+			isSuccess := false
+			if msg.Type == "http_response" {
+				if status, ok := msg.Payload["status"].(float64); ok && int(status) == http.StatusOK {
+					isSuccess = true
+				}
+			} else if msg.Type == "stream_start" {
+				isSuccess = true
+			}
+
+			if isSuccess {
+				log.Printf("Request %s succeeded on connection %d", wsPayload.ID, i+1)
+				// 成功，处理剩余的响应
+				processWebSocketResponse(w, r, respChan, modelName, msg) // 传入初始消息
+				cancel()
+				pendingRequests.Delete(wsPayload.ID)
+				return
+			}
+			// 收到的是错误或非200响应
+			log.Printf("Attempt %d for request %s failed with message type %s", i+1, wsPayload.ID, msg.Type)
+			if msg.Type == "error" {
+				if errMsg, ok := msg.Payload["error"].(string); ok {
+					lastError = errors.New(errMsg)
+				}
+			} else {
+				lastError = fmt.Errorf("received non-successful status on attempt %d", i+1)
+			}
+
+		case <-ctx.Done():
+			log.Printf("Gateway Timeout on attempt %d for request %s", i+1, wsPayload.ID)
+			lastError = ctx.Err()
+		}
+		cancel()
+		pendingRequests.Delete(wsPayload.ID) // 清理
 	}
 
-	// 4. 异步等待并处理响应
-	processWebSocketResponse(w, r, respChan)
+	// 如果循环结束，意味着所有尝试都失败了
+	log.Printf("All %d connection attempts failed for request %s. Last error: %v", len(allConns), wsPayload.ID, lastError)
+	recordErrorRequest(http.StatusBadGateway)
+	http.Error(w, "Bad Gateway: All available client connections failed to respond successfully", http.StatusBadGateway)
 }
 
 // handleNativeGeminiProxy 处理原生的Gemini API请求
 func handleNativeGeminiProxy(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Received native Gemini request: Method=%s, Path=%s, From=%s", r.Method, r.URL.Path, r.RemoteAddr)
 
-	// 提取模型名称并记录使用情况
-	go func(path string) {
-		parts := strings.Split(path, "/")
-		for i, part := range parts {
-			if part == "models" && i+1 < len(parts) {
-				modelAndAction := parts[i+1]
-				modelNameParts := strings.Split(modelAndAction, ":")
-				if len(modelNameParts) > 0 {
-					recordUsage(modelNameParts[0])
-				}
-				return
+	// 提取模型名称但先不记录
+	var modelName string
+	parts := strings.Split(r.URL.Path, "/")
+	for i, part := range parts {
+		if part == "models" && i+1 < len(parts) {
+			modelAndAction := parts[i+1]
+			modelNameParts := strings.Split(modelAndAction, ":")
+			if len(modelNameParts) > 0 {
+				modelName = modelNameParts[0]
 			}
+			break // 找到就退出
 		}
-	}(r.URL.Path)
+	}
 
 	// 1. 使用专门为原生Gemini请求设计的宽松认证
 	userID, err := authenticateNativeRequest(r)
 	if err != nil {
+		recordErrorRequest(http.StatusUnauthorized)
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
 	}
@@ -501,6 +581,7 @@ func handleNativeGeminiProxy(w http.ResponseWriter, r *http.Request) {
 	reqID := uuid.NewString()
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
+		recordErrorRequest(http.StatusInternalServerError)
 		http.Error(w, "Failed to read request body", http.StatusInternalServerError)
 		return
 	}
@@ -526,17 +607,15 @@ func handleNativeGeminiProxy(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	// 3. 调用核心转发逻辑
-	forwardRequestToBrowser(w, r, userID, requestPayload)
+	// 3. 调用核心转发逻辑，并传入模型名称用于成功后记录
+	forwardRequestToBrowser(w, r, userID, requestPayload, modelName)
 }
 
-// processWebSocketResponse 处理来自WS通道的响应，构建HTTP响应
-func processWebSocketResponse(w http.ResponseWriter, r *http.Request, respChan chan *WSMessage) {
-	// 设置超时
+// processWebSocketResponse 处理来自成功连接的后续响应
+func processWebSocketResponse(w http.ResponseWriter, r *http.Request, respChan chan *WSMessage, modelName string, initialMsg *WSMessage) {
 	ctx, cancel := context.WithTimeout(r.Context(), proxyRequestTimeout)
 	defer cancel()
 
-	// 获取Flusher以支持流式响应
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		log.Println("Warning: ResponseWriter does not support flushing, streaming will be buffered.")
@@ -544,92 +623,106 @@ func processWebSocketResponse(w http.ResponseWriter, r *http.Request, respChan c
 
 	headersSet := false
 
+	// 处理已经收到的初始成功消息
+	processMessage := func(msg *WSMessage) bool {
+		switch msg.Type {
+		case "http_response":
+			if headersSet {
+				log.Println("Received http_response after headers were already set. Ignoring.")
+				return true // 结束
+			}
+			status, ok := msg.Payload["status"].(float64)
+			statusCode := http.StatusOK
+			if ok {
+				statusCode = int(status)
+			}
+			if statusCode == http.StatusOK && modelName != "" {
+				recordUsage(modelName)
+			}
+			setResponseHeaders(w, msg.Payload)
+			w.WriteHeader(statusCode)
+			writeBody(w, msg.Payload)
+			return true // 结束
+
+		case "stream_start":
+			if headersSet {
+				log.Println("Received stream_start after headers were already set. Ignoring.")
+				return false // 继续
+			}
+			setResponseHeaders(w, msg.Payload)
+			writeStatusCode(w, msg.Payload)
+			headersSet = true
+			if flusher != nil {
+				flusher.Flush()
+			}
+
+		case "stream_chunk":
+			if !headersSet {
+				log.Println("Warning: Received stream_chunk before stream_start. Using default 200 OK.")
+				w.WriteHeader(http.StatusOK)
+				headersSet = true
+			}
+			writeBody(w, msg.Payload)
+			if flusher != nil {
+				flusher.Flush()
+			}
+
+		case "stream_end":
+			if modelName != "" {
+				recordUsage(modelName)
+			}
+			if !headersSet {
+				w.WriteHeader(http.StatusOK)
+			}
+			return true // 结束
+
+		case "error":
+			if !headersSet {
+				errMsg := "Bad Gateway: Client reported an error"
+				if payloadErr, ok := msg.Payload["error"].(string); ok {
+					errMsg = payloadErr
+				}
+				statusCode := http.StatusBadGateway
+				if code, ok := msg.Payload["status"].(float64); ok {
+					statusCode = int(code)
+				}
+				recordErrorRequest(statusCode)
+				http.Error(w, errMsg, statusCode)
+			} else {
+				log.Printf("Error received from client after stream started: %v", msg.Payload)
+			}
+			return true // 结束
+
+		default:
+			log.Printf("Received unexpected message type %s while waiting for response", msg.Type)
+		}
+		return false // 默认继续
+	}
+
+	if processMessage(initialMsg) {
+		return
+	}
+
+	// 循环处理后续消息
 	for {
 		select {
 		case msg, ok := <-respChan:
 			if !ok {
-				// 通道被关闭，理论上不应该发生，除非有panic
 				if !headersSet {
+					recordErrorRequest(http.StatusInternalServerError)
 					http.Error(w, "Internal Server Error: Response channel closed unexpectedly", http.StatusInternalServerError)
 				}
 				return
 			}
-
-			switch msg.Type {
-			case "http_response":
-				// 标准单个响应
-				if headersSet {
-					log.Println("Received http_response after headers were already set. Ignoring.")
-					return
-				}
-				setResponseHeaders(w, msg.Payload)
-				writeStatusCode(w, msg.Payload)
-				writeBody(w, msg.Payload)
-				return // 请求结束
-
-			case "stream_start":
-				// 流开始
-				if headersSet {
-					log.Println("Received stream_start after headers were already set. Ignoring.")
-					continue
-				}
-				setResponseHeaders(w, msg.Payload)
-				writeStatusCode(w, msg.Payload)
-				headersSet = true
-				if flusher != nil {
-					flusher.Flush()
-				}
-
-			case "stream_chunk":
-				// 流数据块
-				if !headersSet {
-					// 如果还没收到stream_start，先设置默认头
-					log.Println("Warning: Received stream_chunk before stream_start. Using default 200 OK.")
-					w.WriteHeader(http.StatusOK)
-					headersSet = true
-				}
-				writeBody(w, msg.Payload)
-				if flusher != nil {
-					flusher.Flush() // 立即将数据块发送给客户端
-				}
-
-			case "stream_end":
-				// 流结束
-				if !headersSet {
-					// 如果流结束了但还没设置头，设置一个默认的
-					w.WriteHeader(http.StatusOK)
-				}
-				return // 请求结束
-
-			case "error":
-				// 前端返回错误
-				if !headersSet {
-					errMsg := "Bad Gateway: Client reported an error"
-					if payloadErr, ok := msg.Payload["error"].(string); ok {
-						errMsg = payloadErr
-					}
-					statusCode := http.StatusBadGateway
-					if code, ok := msg.Payload["status"].(float64); ok {
-						statusCode = int(code)
-					}
-					http.Error(w, errMsg, statusCode)
-				} else {
-					// 如果已经开始发送流，我们只能记录错误并关闭连接
-					log.Printf("Error received from client after stream started: %v", msg.Payload)
-				}
-				return // 请求结束
-
-			default:
-				log.Printf("Received unexpected message type %s while waiting for response", msg.Type)
+			if processMessage(msg) {
+				return
 			}
-
 		case <-ctx.Done():
-			// 超时
 			if !headersSet {
 				log.Printf("Gateway Timeout: No response from client for request %s", r.URL.Path)
+				recordErrorRequest(http.StatusGatewayTimeout)
 				http.Error(w, "Gateway Timeout", http.StatusGatewayTimeout)
 			} else {
-				// 如果流已经开始，我们只能记录日志并断开连接
 				log.Printf("Gateway Timeout: Stream incomplete for request %s", r.URL.Path)
 			}
 			return
@@ -662,11 +755,15 @@ func setResponseHeaders(w http.ResponseWriter, payload map[string]interface{}) {
 // writeStatusCode 从payload中解析并设置HTTP状态码
 func writeStatusCode(w http.ResponseWriter, payload map[string]interface{}) {
 	status, ok := payload["status"].(float64) // JSON数字默认为float64
-	if !ok {
-		w.WriteHeader(http.StatusOK) // 默认200
-		return
+	statusCode := http.StatusOK
+	if ok {
+		statusCode = int(status)
 	}
-	w.WriteHeader(int(status))
+
+	if statusCode != http.StatusOK {
+		recordErrorRequest(statusCode)
+	}
+	w.WriteHeader(statusCode)
 }
 
 // writeBody 从payload中解析并写入HTTP响应体
@@ -872,6 +969,7 @@ func handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
 	// We use the same authentication as the chat proxy, as the client should provide a key
 	userID, googleAPIKey, err := authenticateAndGetGoogleKey(r)
 	if err != nil {
+		recordErrorRequest(http.StatusUnauthorized)
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
 	}
@@ -898,19 +996,24 @@ func handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
 	recorder := httptest.NewRecorder()
 
 	// Directly call the core logic that talks to the browser
-	forwardRequestToBrowser(recorder, r, userID, wsPayload)
+	// modelName 传空字符串，因为这个函数会自己处理成功记录
+	forwardRequestToBrowser(recorder, r, userID, wsPayload, "")
 
 	// --- Process and convert the response back ---
 	if recorder.Code != http.StatusOK {
-		// If the proxy logic returned an error, forward it
+		// 如果代理逻辑返回了非200错误，记录它
+		recordErrorRequest(recorder.Code)
 		w.WriteHeader(recorder.Code)
 		w.Write(recorder.Body.Bytes())
 		return
 	}
+	// 只有成功时才记录
+	recordUsage("models-list") // 使用一个固定的名称来记录模型列表的调用
 
 	// Handle non-streaming response
 	var geminiResp GeminiModelListResponse
 	if err := json.NewDecoder(recorder.Body).Decode(&geminiResp); err != nil {
+		recordErrorRequest(http.StatusInternalServerError)
 		http.Error(w, "Failed to decode gemini models response: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -926,15 +1029,14 @@ func handleOpenAIProxy(w http.ResponseWriter, r *http.Request) {
 
 	var openAIReq OpenAIRequest
 	if err := json.NewDecoder(r.Body).Decode(&openAIReq); err != nil {
+		recordErrorRequest(http.StatusBadRequest)
 		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	// 记录模型使用情况
-	go recordUsage(openAIReq.Model)
-
 	geminiReq, err := convertOpenAIToGemini(&openAIReq)
 	if err != nil {
+		recordErrorRequest(http.StatusInternalServerError)
 		http.Error(w, "Failed to convert request: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -942,6 +1044,7 @@ func handleOpenAIProxy(w http.ResponseWriter, r *http.Request) {
 	// --- Authenticate the request and get the key for Google ---
 	userID, googleAPIKey, err := authenticateAndGetGoogleKey(r)
 	if err != nil {
+		recordErrorRequest(http.StatusUnauthorized)
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
 	}
@@ -949,6 +1052,7 @@ func handleOpenAIProxy(w http.ResponseWriter, r *http.Request) {
 	// --- Prepare payload for WebSocket ---
 	geminiReqBytes, err := json.Marshal(geminiReq)
 	if err != nil {
+		recordErrorRequest(http.StatusInternalServerError)
 		http.Error(w, "Failed to marshal gemini request", http.StatusInternalServerError)
 		return
 	}
@@ -989,6 +1093,7 @@ func handleOpenAIProxy(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Connection", "keep-alive")
 		flusher, ok := w.(http.Flusher)
 		if !ok {
+			recordErrorRequest(http.StatusInternalServerError)
 			http.Error(w, "Streaming unsupported!", http.StatusInternalServerError)
 			return
 		}
@@ -1000,11 +1105,13 @@ func handleOpenAIProxy(w http.ResponseWriter, r *http.Request) {
 
 		selectedConn, err := globalPool.GetConnection(userID)
 		if err != nil {
+			recordErrorRequest(http.StatusServiceUnavailable)
 			http.Error(w, "Service Unavailable: No active client connected", http.StatusServiceUnavailable)
 			return
 		}
 
 		if err := selectedConn.safeWriteJSON(wsPayload); err != nil {
+			recordErrorRequest(http.StatusBadGateway)
 			http.Error(w, "Bad Gateway: Failed to send request to client", http.StatusBadGateway)
 			return
 		}
@@ -1071,6 +1178,7 @@ func handleOpenAIProxy(w http.ResponseWriter, r *http.Request) {
 					}
 
 				case "stream_end":
+					recordUsage(openAIReq.Model)
 					fmt.Fprintf(w, "data: [DONE]\n\n")
 					flusher.Flush()
 					return
@@ -1094,16 +1202,22 @@ func handleOpenAIProxy(w http.ResponseWriter, r *http.Request) {
 	} else {
 		// For non-streaming, the original recorder logic is correct.
 		recorder := httptest.NewRecorder()
-		forwardRequestToBrowser(recorder, r, userID, wsPayload)
+		// modelName 传空字符串，让此函数自己处理成功记录
+		forwardRequestToBrowser(recorder, r, userID, wsPayload, "")
 
 		if recorder.Code != http.StatusOK {
+			recordErrorRequest(recorder.Code)
 			w.WriteHeader(recorder.Code)
 			w.Write(recorder.Body.Bytes())
 			return
 		}
 
+		// 只有成功时才记录
+		recordUsage(openAIReq.Model)
+
 		var geminiResp GeminiResponse
 		if err := json.NewDecoder(recorder.Body).Decode(&geminiResp); err != nil {
+			recordErrorRequest(http.StatusInternalServerError)
 			http.Error(w, "Failed to decode gemini response: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -1132,6 +1246,7 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(statsCopy); err != nil {
 		log.Printf("序列化统计数据时出错: %v", err)
+		recordErrorRequest(http.StatusInternalServerError)
 		http.Error(w, "无法序列化统计数据", http.StatusInternalServerError)
 	}
 }

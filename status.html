@@ -15,6 +15,7 @@
         tr:hover { background-color: #e9ecef; }
         #charts-wrapper { display: flex; flex-wrap: wrap; gap: 2em; margin-bottom: 2em; }
         .chart-container { flex: 1; min-width: 400px; height: 500px; background-color: #fff; box-shadow: 0 2px 5px rgba(0,0,0,0.1); border-radius: 8px; padding: 1em; }
+        .stats-section { margin-top: 3em; }
         #date-range-container { text-align: center; margin-bottom: 2em; }
         label[for="date-range-selector"] { margin-right: 10px; font-weight: bold; color: #555; }
         #date-range-selector {
@@ -52,72 +53,100 @@
     <div id="charts-wrapper">
         <div id="bar-chart-container" class="chart-container"></div>
         <div id="pie-chart-container" class="chart-container"></div>
+        <div id="error-chart-container" class="chart-container"></div>
     </div>
 
-    <h2>详细数据</h2>
-    <table id="stats-table">
-        <thead>
-            <tr>
-                <th>日期 (UTC)</th>
-                <th>模型名称</th>
-                <th>调用次数</th>
-            </tr>
-        </thead>
-        <tbody></tbody>
-    </table>
+    <div class="stats-section">
+        <h2>模型调用详细数据</h2>
+        <table id="stats-table">
+            <thead>
+                <tr>
+                    <th>日期 (UTC)</th>
+                    <th>模型名称</th>
+                    <th>调用次数</th>
+                </tr>
+            </thead>
+            <tbody></tbody>
+        </table>
+    </div>
+
+    <div class="stats-section">
+        <h2>错误统计详细数据</h2>
+        <table id="error-stats-table">
+            <thead>
+                <tr>
+                    <th>日期 (UTC)</th>
+                    <th>错误类型</th>
+                    <th>出现次数</th>
+                </tr>
+            </thead>
+            <tbody></tbody>
+        </table>
+    </div>
 
     <script>
         const barChartDom = document.getElementById('bar-chart-container');
         const pieChartDom = document.getElementById('pie-chart-container');
+        const errorChartDom = document.getElementById('error-chart-container');
         const myBarChart = echarts.init(barChartDom);
         const myPieChart = echarts.init(pieChartDom);
+        const myErrorChart = echarts.init(errorChartDom);
         const dateRangeSelector = document.getElementById('date-range-selector');
 
         async function fetchStats() {
             try {
                 const response = await fetch('/stats');
                 if (!response.ok) throw new Error('Network response was not ok');
-                const data = await response.json();
+                const rawData = await response.json();
 
-                const filteredData = filterDataByDateRange(data);
-                updateTable(filteredData);
-                updateBarChart(filteredData);
-                updatePieChart(filteredData);
+                const { modelData, errorData } = processAndFilterData(rawData);
+
+                updateModelTable(modelData);
+                updateModelBarChart(modelData);
+                updateModelPieChart(modelData);
+                
+                updateErrorTable(errorData);
+                updateErrorBarChart(errorData);
+
 
             } catch (error) {
                 console.error('获取统计数据时出错:', error);
                 document.querySelector('#stats-table tbody').innerHTML = '<tr><td colspan="3">加载统计数据失败.</td></tr>';
+                document.querySelector('#error-stats-table tbody').innerHTML = '<tr><td colspan="3">加载统计数据失败.</td></tr>';
                 myBarChart.showLoading('default', { text: '加载数据失败' });
                 myPieChart.showLoading('default', { text: '加载数据失败' });
+                myErrorChart.showLoading('default', { text: '加载数据失败' });
             }
         }
 
-        function filterDataByDateRange(data) {
+        function processAndFilterData(rawData) {
             const days = parseInt(dateRangeSelector.value, 10);
-            if (days === 0) {
-                return data; // 0 表示所有时间
+            const modelData = {};
+            const errorData = {};
+
+            const cutoffDate = new Date();
+            if (days !== 0) {
+                cutoffDate.setDate(cutoffDate.getDate() - days);
+                cutoffDate.setHours(0, 0, 0, 0);
             }
 
-            const filteredData = {};
-            const cutoffDate = new Date();
-            cutoffDate.setDate(cutoffDate.getDate() - days);
-            
-            // 将 cutoffDate 的时间设置为 00:00:00 以便进行正确的日期比较
-            cutoffDate.setHours(0, 0, 0, 0);
-
-            for (const key in data) {
+            for (const key in rawData) {
                 const parts = key.split('-');
                 const dateStr = parts.slice(-3).join('-');
                 const entryDate = new Date(dateStr);
 
-                if (entryDate >= cutoffDate) {
-                    filteredData[key] = data[key];
+                if (days === 0 || entryDate >= cutoffDate) {
+                    if (key.startsWith('error-status-')) {
+                        errorData[key] = rawData[key];
+                    } else {
+                        modelData[key] = rawData[key];
+                    }
                 }
             }
-            return filteredData;
+            return { modelData, errorData };
         }
 
-        function updateTable(data) {
+        function updateModelTable(data) {
             const tableBody = document.querySelector('#stats-table tbody');
             tableBody.innerHTML = '';
             const stats = [];
@@ -134,13 +163,36 @@
             } else {
                 stats.forEach(stat => {
                     const row = document.createElement('tr');
-                    row.innerHTML = '<td>' + stat.date + '</td><td>' + stat.model + '</td><td>' + stat.count + '</td>';
+                    row.innerHTML = `<td>${stat.date}</td><td>${stat.model}</td><td>${stat.count}</td>`;
                     tableBody.appendChild(row);
                 });
             }
         }
 
-        function updateBarChart(data) {
+        function updateErrorTable(data) {
+            const tableBody = document.querySelector('#error-stats-table tbody');
+            tableBody.innerHTML = '';
+            const stats = [];
+            for (const key in data) {
+                const parts = key.split('-'); // e.g., "error-status-500-2023-10-27"
+                const date = parts.slice(-3).join('-');
+                const errorType = parts.slice(0, -3).join('-');
+                stats.push({ date, errorType, count: data[key] });
+            }
+            stats.sort((a, b) => (b.date + a.errorType).localeCompare(a.date + b.errorType));
+
+            if (stats.length === 0) {
+                tableBody.innerHTML = '<tr><td colspan="3">暂无错误</td></tr>';
+            } else {
+                stats.forEach(stat => {
+                    const row = document.createElement('tr');
+                    row.innerHTML = `<td>${stat.date}</td><td>${stat.errorType}</td><td>${stat.count}</td>`;
+                    tableBody.appendChild(row);
+                });
+            }
+        }
+
+        function updateModelBarChart(data) {
             const allDates = new Set();
             const allModels = new Set();
             const processedData = {}; // { date: { model: count } }
@@ -180,11 +232,11 @@
                  myBarChart.showLoading('default', { text: '暂无数据' });
             } else {
                 myBarChart.hideLoading();
-                myBarChart.setOption(option);
+                myBarChart.setOption(option, true);
             }
         }
 
-        function updatePieChart(data) {
+        function updateModelPieChart(data) {
             const modelTotals = {};
             for (const key in data) {
                 const parts = key.split('-');
@@ -223,21 +275,70 @@
                 myPieChart.showLoading('default', { text: '暂无数据' });
             } else {
                 myPieChart.hideLoading();
-                myPieChart.setOption(option);
+                myPieChart.setOption(option, true);
+            }
+        }
+
+        function updateErrorBarChart(data) {
+            const allDates = new Set();
+            const allErrorTypes = new Set();
+            const processedData = {}; // { date: { errorType: count } }
+
+            for (const key in data) {
+                const parts = key.split('-');
+                const date = parts.slice(-3).join('-');
+                const errorType = parts.slice(0, -3).join('-');
+                allDates.add(date);
+                allErrorTypes.add(errorType);
+                if (!processedData[date]) processedData[date] = {};
+                processedData[date][errorType] = data[key];
+            }
+
+            const sortedDates = Array.from(allDates).sort((a, b) => a.localeCompare(b));
+            const sortedErrorTypes = Array.from(allErrorTypes).sort();
+
+            const series = sortedErrorTypes.map(errorType => ({
+                name: errorType,
+                type: 'bar',
+                stack: 'total',
+                emphasis: { focus: 'series' },
+                data: sortedDates.map(date => processedData[date][errorType] || 0)
+            }));
+
+            const option = {
+                title: { text: '每日错误统计 (堆叠条形图)', left: 'center' },
+                tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
+                legend: { data: sortedErrorTypes, top: 'bottom' },
+                grid: { left: '3%', right: '4%', bottom: '10%', containLabel: true },
+                xAxis: [{ type: 'category', data: sortedDates }],
+                yAxis: [{ type: 'value' }],
+                series: series
+            };
+            
+            if (Object.keys(data).length === 0) {
+                 myErrorChart.showLoading('default', { text: '暂无错误' });
+            } else {
+                myErrorChart.hideLoading();
+                myErrorChart.setOption(option, true);
             }
         }
         
         window.addEventListener('resize', () => {
             myBarChart.resize();
             myPieChart.resize();
+            myErrorChart.resize();
         });
         
-        myBarChart.showLoading('default', { text: '正在加载数据...' });
-        myPieChart.showLoading('default', { text: '正在加载数据...' });
-        fetchStats();
-        setInterval(fetchStats, 5000);
+        function initCharts() {
+            myBarChart.showLoading('default', { text: '正在加载数据...' });
+            myPieChart.showLoading('default', { text: '正在加载数据...' });
+            myErrorChart.showLoading('default', { text: '正在加载数据...' });
+            fetchStats();
+            setInterval(fetchStats, 5000);
+            dateRangeSelector.addEventListener('change', fetchStats);
+        }
 
-        dateRangeSelector.addEventListener('change', fetchStats);
+        initCharts();
     </script>
 </body>
 </html>
