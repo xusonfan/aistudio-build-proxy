@@ -352,7 +352,7 @@ func (p *ConnectionPool) GetConnection(userID string) (*UserConnection, error) {
 	return selectedConn, nil
 }
 
-// GetAllConnections 获取用户的所有活动连接
+// GetAllConnections 获取用户的所有活动连接,并按轮询顺序排列
 func (p *ConnectionPool) GetAllConnections(userID string) []*UserConnection {
 	p.RLock()
 	userConns, exists := p.Users[userID]
@@ -365,10 +365,22 @@ func (p *ConnectionPool) GetAllConnections(userID string) []*UserConnection {
 	userConns.Lock()
 	defer userConns.Unlock()
 
-	// 返回连接切片的副本以确保线程安全
-	connsCopy := make([]*UserConnection, len(userConns.Connections))
-	copy(connsCopy, userConns.Connections)
-	return connsCopy
+	numConns := len(userConns.Connections)
+	if numConns == 0 {
+		return nil
+	}
+
+	// 轮询负载均衡：确定起始点，并为下一次调用更新索引
+	startIndex := userConns.NextIndex % numConns
+	userConns.NextIndex = (userConns.NextIndex + 1) % numConns
+
+	// 创建一个从 startIndex 开始的旋转列表，以实现负载均衡
+	rotatedConns := make([]*UserConnection, numConns)
+	for i := 0; i < numConns; i++ {
+		rotatedConns[i] = userConns.Connections[(startIndex+i)%numConns]
+	}
+
+	return rotatedConns
 }
 
 // --- 2. WebSocket 消息结构 & 待处理请求 ---
