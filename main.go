@@ -1118,17 +1118,6 @@ func handleOpenAIProxy(w http.ResponseWriter, r *http.Request) {
 
 var statsHTML []byte // 用于缓存 status.html 的内容
 
-// handleStatsUI 提供一个简单的前端页面来展示统计数据
-func handleStatsUI(w http.ResponseWriter, r *http.Request) {
-	// 如果是根路径以外的请求，返回404
-	if r.URL.Path != "/" {
-		http.NotFound(w, r)
-		return
-	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Write(statsHTML)
-}
-
 // handleStats 以JSON格式返回当前的API使用统计数据
 func handleStats(w http.ResponseWriter, r *http.Request) {
 	usageStatsMutex.RLock()
@@ -1185,8 +1174,19 @@ func main() {
 
 	// API 统计路由
 	mux.HandleFunc("/stats", handleStats)
-	// 统计前端页面路由
-	mux.HandleFunc("/", handleStatsUI)
+	// 根路由和静态文件服务
+	// 创建一个文件服务器，为当前目录下的文件提供服务
+	fs := http.FileServer(http.Dir("."))
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// 如果请求的是根路径，我们专门提供 status.html
+		if r.URL.Path == "/" {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.Write(statsHTML)
+			return
+		}
+		// 对于所有其他路径 (例如 /echarts.min.js), 让文件服务器来处理
+		fs.ServeHTTP(w, r)
+	})
 
 	// 将 CORS 中间件应用到所有 HTTP 路由
 	handler := corsMiddleware(mux)

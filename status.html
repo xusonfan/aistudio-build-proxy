@@ -15,13 +15,38 @@
         tr:hover { background-color: #e9ecef; }
         #charts-wrapper { display: flex; flex-wrap: wrap; gap: 2em; margin-bottom: 2em; }
         .chart-container { flex: 1; min-width: 400px; height: 500px; background-color: #fff; box-shadow: 0 2px 5px rgba(0,0,0,0.1); border-radius: 8px; padding: 1em; }
+        #date-range-container { text-align: center; margin-bottom: 2em; }
+        label[for="date-range-selector"] { margin-right: 10px; font-weight: bold; color: #555; }
+        #date-range-selector {
+            padding: 8px 12px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            background-color: #fff;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            cursor: pointer;
+            font-size: 1em;
+            transition: border-color 0.2s;
+        }
+        #date-range-selector:focus {
+            outline: none;
+            border-color: #007bff;
+        }
     </style>
     <!-- 引入 ECharts -->
-    <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+    <script src="echarts.min.js"></script>
 </head>
 <body>
     <h1>API 使用统计</h1>
     <p style="text-align: center;">数据每 5 秒自动刷新</p>
+
+    <div id="date-range-container">
+        <label for="date-range-selector">时间范围:</label>
+        <select id="date-range-selector">
+            <option value="7" selected>最近 7 天</option>
+            <option value="30">最近 30 天</option>
+            <option value="0">所有时间</option>
+        </select>
+    </div>
 
     <!-- ECharts 图表容器 -->
     <div id="charts-wrapper">
@@ -46,6 +71,7 @@
         const pieChartDom = document.getElementById('pie-chart-container');
         const myBarChart = echarts.init(barChartDom);
         const myPieChart = echarts.init(pieChartDom);
+        const dateRangeSelector = document.getElementById('date-range-selector');
 
         async function fetchStats() {
             try {
@@ -53,9 +79,10 @@
                 if (!response.ok) throw new Error('Network response was not ok');
                 const data = await response.json();
 
-                updateTable(data);
-                updateBarChart(data);
-                updatePieChart(data);
+                const filteredData = filterDataByDateRange(data);
+                updateTable(filteredData);
+                updateBarChart(filteredData);
+                updatePieChart(filteredData);
 
             } catch (error) {
                 console.error('获取统计数据时出错:', error);
@@ -63,6 +90,31 @@
                 myBarChart.showLoading('default', { text: '加载数据失败' });
                 myPieChart.showLoading('default', { text: '加载数据失败' });
             }
+        }
+
+        function filterDataByDateRange(data) {
+            const days = parseInt(dateRangeSelector.value, 10);
+            if (days === 0) {
+                return data; // 0 表示所有时间
+            }
+
+            const filteredData = {};
+            const cutoffDate = new Date();
+            cutoffDate.setDate(cutoffDate.getDate() - days);
+            
+            // 将 cutoffDate 的时间设置为 00:00:00 以便进行正确的日期比较
+            cutoffDate.setHours(0, 0, 0, 0);
+
+            for (const key in data) {
+                const parts = key.split('-');
+                const dateStr = parts.slice(-3).join('-');
+                const entryDate = new Date(dateStr);
+
+                if (entryDate >= cutoffDate) {
+                    filteredData[key] = data[key];
+                }
+            }
+            return filteredData;
         }
 
         function updateTable(data) {
@@ -184,6 +236,8 @@
         myPieChart.showLoading('default', { text: '正在加载数据...' });
         fetchStats();
         setInterval(fetchStats, 5000);
+
+        dateRangeSelector.addEventListener('change', fetchStats);
     </script>
 </body>
 </html>
