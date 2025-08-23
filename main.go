@@ -241,6 +241,7 @@ type UserConnection struct {
 	UserID     string
 	LastActive time.Time
 	writeMutex sync.Mutex // 保护对此单个连接的并发写入
+	Healthy    bool       // 连接是否健康可用
 }
 
 // safeWriteJSON 线程安全地向单个WebSocket连接写入JSON
@@ -273,6 +274,7 @@ func (p *ConnectionPool) AddConnection(userID string, conn *websocket.Conn) *Use
 		Conn:       conn,
 		UserID:     userID,
 		LastActive: time.Now(),
+		Healthy:    true, // 新连接默认为健康状态
 	}
 
 	p.Lock()
@@ -370,17 +372,70 @@ func (p *ConnectionPool) GetAllConnections(userID string) []*UserConnection {
 		return nil
 	}
 
+	// 首先过滤出健康的连接
+	healthyConns := make([]*UserConnection, 0)
+	for _, conn := range userConns.Connections {
+		if conn.Healthy {
+			healthyConns = append(healthyConns, conn)
+		}
+	}
+
+	numHealthyConns := len(healthyConns)
+	if numHealthyConns == 0 {
+		// 如果没有健康的连接，返回所有连接（降级处理）
+		healthyConns = userConns.Connections
+		numHealthyConns = numConns
+	}
+
 	// 轮询负载均衡：确定起始点，并为下一次调用更新索引
-	startIndex := userConns.NextIndex % numConns
-	userConns.NextIndex = (userConns.NextIndex + 1) % numConns
+	startIndex := userConns.NextIndex % numHealthyConns
+	userConns.NextIndex = (userConns.NextIndex + 1) % numHealthyConns
 
 	// 创建一个从 startIndex 开始的旋转列表，以实现负载均衡
-	rotatedConns := make([]*UserConnection, numConns)
-	for i := 0; i < numConns; i++ {
-		rotatedConns[i] = userConns.Connections[(startIndex+i)%numConns]
+	rotatedConns := make([]*UserConnection, numHealthyConns)
+	for i := 0; i < numHealthyConns; i++ {
+		rotatedConns[i] = healthyConns[(startIndex+i)%numHealthyConns]
 	}
 
 	return rotatedConns
+}
+
+// markConnectionUnhealthy 标记连接为不健康状态
+func markConnectionUnhealthy(conn *UserConnection) {
+	conn.Healthy = false
+	log.Printf("标记连接为不健康状态: UserID=%s", conn.UserID)
+}
+
+// markConnectionHealthy 标记连接为健康状态
+func markConnectionHealthy(conn *UserConnection) {
+	conn.Healthy = true
+	log.Printf("标记连接为健康状态: UserID=%s", conn.UserID)
+}
+
+// recoverUnhealthyConnections 定期恢复不健康的连接
+func recoverUnhealthyConnections() {
+	globalPool.RLock()
+	defer globalPool.RUnlock()
+
+	recoveredCount := 0
+	for userID, userConns := range globalPool.Users {
+		userConns.Lock()
+		for _, conn := range userConns.Connections {
+			if !conn.Healthy {
+				// 检查连接是否仍然活跃（通过最后活动时间）
+				if time.Since(conn.LastActive) < 5*time.Minute {
+					conn.Healthy = true
+					recoveredCount++
+					log.Printf("自动恢复不健康连接: UserID=%s", userID)
+				}
+			}
+		}
+		userConns.Unlock()
+	}
+
+	if recoveredCount > 0 {
+		log.Printf("共恢复了 %d 个不健康连接", recoveredCount)
+	}
 }
 
 // --- 2. WebSocket 消息结构 & 待处理请求 ---
@@ -456,6 +511,10 @@ func readPump(uc *UserConnection) {
 		// 收到任何消息，重置读取超时
 		uc.Conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
 		uc.LastActive = time.Now()
+		// 如果连接之前被标记为不健康，现在恢复为健康状态
+		if !uc.Healthy {
+			markConnectionHealthy(uc)
+		}
 
 		// 解析消息
 		var msg WSMessage
@@ -514,7 +573,9 @@ func forwardRequestToBrowser(w http.ResponseWriter, r *http.Request, userID stri
 			log.Printf("Failed to send request over WebSocket on attempt %d: %v", i+1, err)
 			lastError = err
 			pendingRequests.Delete(wsPayload.ID) // 清理
-			continue                             // 尝试下一个连接
+			// 标记连接为不健康
+			markConnectionUnhealthy(conn)
+			continue // 尝试下一个连接
 		}
 
 		// 等待初始响应
@@ -533,7 +594,9 @@ func forwardRequestToBrowser(w http.ResponseWriter, r *http.Request, userID stri
 
 			if isSuccess {
 				log.Printf("Request %s succeeded on connection %d", wsPayload.ID, i+1)
-				// 成功，处理剩余的响应
+				// 成功，标记连接为健康状态
+				markConnectionHealthy(conn)
+				// 处理剩余的响应
 				processWebSocketResponse(w, r, respChan, modelName, msg) // 传入初始消息
 				cancel()
 				pendingRequests.Delete(wsPayload.ID)
@@ -1282,6 +1345,15 @@ func main() {
 		defer ticker.Stop()
 		for range ticker.C {
 			saveStats()
+		}
+	}()
+
+	// 启动一个goroutine来定期恢复不健康的连接
+	go func() {
+		ticker := time.NewTicker(30 * time.Second) // 每30秒检查一次
+		defer ticker.Stop()
+		for range ticker.C {
+			recoverUnhealthyConnections()
 		}
 	}()
 
