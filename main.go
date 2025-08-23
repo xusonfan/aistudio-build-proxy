@@ -1116,196 +1116,7 @@ func handleOpenAIProxy(w http.ResponseWriter, r *http.Request) {
 
 // --- API统计与前端展示 ---
 
-const statsHTML = `
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>API 使用统计</title>
-    <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; margin: 2em; background-color: #f4f4f9; color: #333; }
-        h1, h2 { color: #444; text-align: center; }
-        table { border-collapse: collapse; width: 100%; margin-top: 2em; box-shadow: 0 2px 5px rgba(0,0,0,0.1); background-color: #fff; }
-        th, td { border: 1px solid #ddd; padding: 12px 15px; text-align: left; }
-        th { background-color: #007bff; color: white; }
-        tr:nth-child(even) { background-color: #f2f2f2; }
-        tr:hover { background-color: #e9ecef; }
-        #charts-wrapper { display: flex; flex-wrap: wrap; gap: 2em; margin-bottom: 2em; }
-        .chart-container { flex: 1; min-width: 400px; height: 500px; background-color: #fff; box-shadow: 0 2px 5px rgba(0,0,0,0.1); border-radius: 8px; padding: 1em; }
-    </style>
-    <!-- 引入 ECharts -->
-    <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
-</head>
-<body>
-    <h1>API 使用统计</h1>
-    <p style="text-align: center;">数据每 5 秒自动刷新</p>
-
-    <!-- ECharts 图表容器 -->
-    <div id="charts-wrapper">
-        <div id="bar-chart-container" class="chart-container"></div>
-        <div id="pie-chart-container" class="chart-container"></div>
-    </div>
-
-    <h2>详细数据</h2>
-    <table id="stats-table">
-        <thead>
-            <tr>
-                <th>日期 (UTC)</th>
-                <th>模型名称</th>
-                <th>调用次数</th>
-            </tr>
-        </thead>
-        <tbody></tbody>
-    </table>
-
-    <script>
-        const barChartDom = document.getElementById('bar-chart-container');
-        const pieChartDom = document.getElementById('pie-chart-container');
-        const myBarChart = echarts.init(barChartDom);
-        const myPieChart = echarts.init(pieChartDom);
-
-        async function fetchStats() {
-            try {
-                const response = await fetch('/stats');
-                if (!response.ok) throw new Error('Network response was not ok');
-                const data = await response.json();
-
-                updateTable(data);
-                updateBarChart(data);
-                updatePieChart(data);
-
-            } catch (error) {
-                console.error('获取统计数据时出错:', error);
-                document.querySelector('#stats-table tbody').innerHTML = '<tr><td colspan="3">加载统计数据失败.</td></tr>';
-                myBarChart.showLoading('default', { text: '加载数据失败' });
-                myPieChart.showLoading('default', { text: '加载数据失败' });
-            }
-        }
-
-        function updateTable(data) {
-            const tableBody = document.querySelector('#stats-table tbody');
-            tableBody.innerHTML = '';
-            const stats = [];
-            for (const key in data) {
-                const parts = key.split('-');
-                const date = parts.slice(-3).join('-');
-                const model = parts.slice(0, -3).join('-');
-                stats.push({ date, model, count: data[key] });
-            }
-            stats.sort((a, b) => (b.date + a.model).localeCompare(a.date + b.model));
-
-            if (stats.length === 0) {
-                tableBody.innerHTML = '<tr><td colspan="3">暂无数据</td></tr>';
-            } else {
-                stats.forEach(stat => {
-                    const row = document.createElement('tr');
-                    row.innerHTML = ` + "`" + `<td>${stat.date}</td><td>${stat.model}</td><td>${stat.count}</td>` + "`" + `;
-                    tableBody.appendChild(row);
-                });
-            }
-        }
-
-        function updateBarChart(data) {
-            const allDates = new Set();
-            const allModels = new Set();
-            const processedData = {}; // { date: { model: count } }
-
-            for (const key in data) {
-                const parts = key.split('-');
-                const date = parts.slice(-3).join('-');
-                const model = parts.slice(0, -3).join('-');
-                allDates.add(date);
-                allModels.add(model);
-                if (!processedData[date]) processedData[date] = {};
-                processedData[date][model] = data[key];
-            }
-
-            const sortedDates = Array.from(allDates).sort((a, b) => a.localeCompare(b));
-            const sortedModels = Array.from(allModels).sort();
-
-            const series = sortedModels.map(model => ({
-                name: model,
-                type: 'bar',
-                stack: 'total',
-                emphasis: { focus: 'series' },
-                data: sortedDates.map(date => processedData[date][model] || 0)
-            }));
-
-            const option = {
-                title: { text: '每日模型调用量 (堆叠条形图)', left: 'center' },
-                tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
-                legend: { data: sortedModels, top: 'bottom' },
-                grid: { left: '3%', right: '4%', bottom: '10%', containLabel: true },
-                xAxis: [{ type: 'category', data: sortedDates }],
-                yAxis: [{ type: 'value' }],
-                series: series
-            };
-            
-            if (Object.keys(data).length === 0) {
-                 myBarChart.showLoading('default', { text: '暂无数据' });
-            } else {
-                myBarChart.hideLoading();
-                myBarChart.setOption(option);
-            }
-        }
-
-        function updatePieChart(data) {
-            const modelTotals = {};
-            for (const key in data) {
-                const parts = key.split('-');
-                const model = parts.slice(0, -3).join('-');
-                modelTotals[model] = (modelTotals[model] || 0) + data[key];
-            }
-
-            const pieData = Object.keys(modelTotals).map(model => ({
-                value: modelTotals[model],
-                name: model
-            }));
-
-            const option = {
-                title: { text: '模型总调用量占比 (饼图)', left: 'center' },
-                tooltip: { trigger: 'item', formatter: '{a} <br/>{b} : {c} ({d}%)' },
-                legend: { orient: 'vertical', left: 'left', data: Object.keys(modelTotals) },
-                series: [
-                    {
-                        name: '模型',
-                        type: 'pie',
-                        radius: '70%',
-                        center: ['50%', '60%'],
-                        data: pieData,
-                        emphasis: {
-                            itemStyle: {
-                                shadowBlur: 10,
-                                shadowOffsetX: 0,
-                                shadowColor: 'rgba(0, 0, 0, 0.5)'
-                            }
-                        }
-                    }
-                ]
-            };
-
-            if (pieData.length === 0) {
-                myPieChart.showLoading('default', { text: '暂无数据' });
-            } else {
-                myPieChart.hideLoading();
-                myPieChart.setOption(option);
-            }
-        }
-        
-        window.addEventListener('resize', () => {
-            myBarChart.resize();
-            myPieChart.resize();
-        });
-        
-        myBarChart.showLoading('default', { text: '正在加载数据...' });
-        myPieChart.showLoading('default', { text: '正在加载数据...' });
-        fetchStats();
-        setInterval(fetchStats, 5000);
-    </script>
-</body>
-</html>
-`
+var statsHTML []byte // 用于缓存 status.html 的内容
 
 // handleStatsUI 提供一个简单的前端页面来展示统计数据
 func handleStatsUI(w http.ResponseWriter, r *http.Request) {
@@ -1315,7 +1126,7 @@ func handleStatsUI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprint(w, statsHTML)
+	w.Write(statsHTML)
 }
 
 // handleStats 以JSON格式返回当前的API使用统计数据
@@ -1339,6 +1150,13 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 // --- 主函数 ---
 
 func main() {
+	// 在程序启动时加载一次HTML文件
+	var err error
+	statsHTML, err = os.ReadFile("status.html")
+	if err != nil {
+		log.Fatalf("无法读取 status.html: %v", err)
+	}
+
 	// 加载持久化的统计数据
 	loadStats()
 
