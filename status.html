@@ -7,7 +7,19 @@
     <title>API 使用统计</title>
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; margin: 2em; background-color: #f4f4f9; color: #333; }
-        h1, h2 { color: #444; text-align: center; }
+        h1, h2 { color: #444; }
+        .title-container {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1em;
+        }
+        .title-container h1 {
+            margin: 0;
+        }
+        #date-range-container {
+            text-align: right;
+        }
         table { border-collapse: collapse; width: 100%; margin-top: 2em; box-shadow: 0 2px 5px rgba(0,0,0,0.1); background-color: #fff; }
         th, td { border: 1px solid #ddd; padding: 12px 15px; text-align: left; }
         th { background-color: #007bff; color: white; }
@@ -32,22 +44,84 @@
             outline: none;
             border-color: #007bff;
         }
+        #total-stats-container {
+            display: flex;
+            justify-content: space-around;
+            gap: 1em;
+            margin-bottom: 2em;
+            text-align: center;
+        }
+        .stat-card {
+            background-color: #fff;
+            padding: 1em 1.5em;
+            border-radius: 8px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+            flex: 1;
+        }
+        .stat-card h3 {
+            margin-top: 0;
+            color: #007bff;
+            font-size: 1em;
+        }
+        .stat-card p {
+            font-size: 1.8em;
+            font-weight: bold;
+            margin-bottom: 0;
+        }
+        .unit-toggle {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            padding: 4px 8px;
+            font-size: 0.8em;
+            background-color: #e9ecef;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        #total-stats-container {
+            position: relative;
+        }
     </style>
     <!-- 引入 ECharts -->
     <script src="echarts.min.js"></script>
 </head>
 <body>
-    <h1>API 使用统计</h1>
-    <p style="text-align: center;">数据每 5 秒自动刷新</p>
-
-    <div id="date-range-container">
-        <label for="date-range-selector">时间范围:</label>
-        <select id="date-range-selector">
-            <option value="7" selected>最近 7 天</option>
-            <option value="30">最近 30 天</option>
-            <option value="0">所有时间</option>
-        </select>
+    <div class="title-container">
+        <h1>API 使用统计</h1>
+        <div id="date-range-container">
+            <div>
+                <label for="date-range-selector">时间范围:</label>
+                <select id="date-range-selector">
+                    <option value="7" selected>最近 7 天</option>
+                    <option value="30">最近 30 天</option>
+                    <option value="0">所有时间</option>
+                </select>
+            </div>
+            <p style="margin: 0.5em 0 0 0; font-size: 0.8em; color: #666;">数据每 5 秒自动刷新</p>
+        </div>
     </div>
+
+    <div id="total-stats-container">
+        <button id="unit-toggle-btn" class="unit-toggle">单位: K</button>
+        <div class="stat-card">
+            <h3>总调用次数</h3>
+            <p id="total-calls">0</p>
+        </div>
+        <div class="stat-card">
+            <h3>总输入 Tokens</h3>
+            <p id="total-prompt-tokens">0</p>
+        </div>
+        <div class="stat-card">
+            <h3>总输出 Tokens</h3>
+            <p id="total-candidates-tokens">0</p>
+        </div>
+        <div class="stat-card">
+            <h3>总 Tokens</h3>
+            <p id="total-tokens">0</p>
+        </div>
+    </div>
+
 
     <!-- ECharts 图表容器 -->
     <div id="charts-wrapper">
@@ -65,8 +139,8 @@
                     <th>日期 (UTC)</th>
                     <th>模型名称</th>
                     <th>调用次数</th>
-                    <th>Prompt Tokens</th>
-                    <th>Candidates Tokens</th>
+                    <th>输入 Tokens</th>
+                    <th>输出 Tokens</th>
                     <th>总 Tokens</th>
                 </tr>
             </thead>
@@ -107,6 +181,7 @@
 
                 const { modelData, errorData } = processAndFilterData(rawData);
 
+                updateTotalStats(modelData);
                 updateModelTable(modelData);
                 updateModelBarChart(modelData);
                 updateModelPieChart(modelData);
@@ -152,6 +227,40 @@
                 }
             }
             return { modelData, errorData };
+        }
+
+        let currentUnit = 'K';
+        let lastModelData = {};
+
+        function formatNumber(num) {
+            if (currentUnit === 'K') {
+                if (num < 1000) return num.toLocaleString();
+                return (num / 1000).toFixed(2) + ' K';
+            } else if (currentUnit === 'M') {
+                return (num / 1000000).toFixed(2) + ' M';
+            }
+            return num.toLocaleString();
+        }
+
+        function updateTotalStats(data) {
+            lastModelData = data; // Store the latest data
+            let totalCalls = 0;
+            let totalPromptTokens = 0;
+            let totalCandidatesTokens = 0;
+            let totalTokens = 0;
+
+            for (const key in data) {
+                const usage = data[key];
+                totalCalls += usage.count || 0;
+                totalPromptTokens += usage.prompt_tokens || 0;
+                totalCandidatesTokens += usage.candidates_tokens || 0;
+                totalTokens += usage.total_tokens || 0;
+            }
+
+            document.getElementById('total-calls').textContent = totalCalls.toLocaleString();
+            document.getElementById('total-prompt-tokens').textContent = formatNumber(totalPromptTokens);
+            document.getElementById('total-candidates-tokens').textContent = formatNumber(totalCandidatesTokens);
+            document.getElementById('total-tokens').textContent = formatNumber(totalTokens);
         }
 
         function updateModelTable(data) {
@@ -398,6 +507,11 @@
             fetchStats();
             setInterval(fetchStats, 5000);
             dateRangeSelector.addEventListener('change', fetchStats);
+            document.getElementById('unit-toggle-btn').addEventListener('click', () => {
+                currentUnit = currentUnit === 'K' ? 'M' : 'K';
+                document.getElementById('unit-toggle-btn').textContent = `单位: ${currentUnit}`;
+                updateTotalStats(lastModelData); // Re-render stats with the new unit
+            });
         }
 
         initCharts();
