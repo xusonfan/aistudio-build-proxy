@@ -49,7 +49,7 @@
             gap: 1em;
             margin-bottom: 1em;
             text-align: center;
-            position: relative;
+            /* position: relative; no longer needed here */
         }
         .stat-card {
             background-color: #fff;
@@ -57,6 +57,7 @@
             border-radius: 8px;
             box-shadow: 0 2px 5px rgba(0,0,0,0.1);
             flex: 1;
+            position: relative; /* Make stat-card a positioning context */
         }
         .stat-card h3 {
             margin-top: 0;
@@ -79,6 +80,17 @@
             border-radius: 4px;
             cursor: pointer;
         }
+        .currency-toggle {
+           position: absolute;
+           top: 10px;
+           right: 10px;
+           padding: 4px 8px;
+           font-size: 0.8em;
+           background-color: #e9ecef;
+           border: 1px solid #ddd;
+           border-radius: 4px;
+           cursor: pointer;
+       }
         .status-healthy { color: #28a745; font-weight: bold; }
         .status-unhealthy { color: #dc3545; font-weight: bold; }
     </style>
@@ -102,7 +114,6 @@
     </div>
 
     <div id="total-stats-container">
-        <button id="unit-toggle-btn" class="unit-toggle">单位: K</button>
         <div class="stat-card">
             <h3>总调用次数</h3>
             <p id="total-calls">0</p>
@@ -118,6 +129,12 @@
         <div class="stat-card">
             <h3>总 Tokens</h3>
             <p id="total-tokens">0</p>
+            <button id="unit-toggle-btn" class="unit-toggle">单位: M</button>
+        </div>
+        <div class="stat-card">
+            <h3 id="total-cost-title">总费用 (CNY)</h3>
+            <p id="total-cost">$0.00</p>
+            <button id="currency-toggle-btn" class="currency-toggle">货币: CNY</button>
         </div>
     </div>
 
@@ -155,6 +172,7 @@
                     <th>输入 Tokens</th>
                     <th>输出 Tokens</th>
                     <th>总 Tokens</th>
+                    <th id="cost-header">费用 (CNY)</th>
                 </tr>
             </thead>
             <tbody></tbody>
@@ -254,7 +272,10 @@
             return { modelData, errorData };
         }
 
-        let currentUnit = 'K';
+        let currentUnit = 'M';
+        // 汇率可以根据需要动态获取，这里使用静态值
+        const USD_TO_CNY_RATE = 7.25;
+        let currentCurrency = 'CNY';
         let lastModelData = {};
 
         function formatNumber(num) {
@@ -273,6 +294,7 @@
             let totalPromptTokens = 0;
             let totalCandidatesTokens = 0;
             let totalTokens = 0;
+            let totalCost = 0;
 
             for (const key in data) {
                 const usage = data[key];
@@ -280,12 +302,19 @@
                 totalPromptTokens += usage.prompt_tokens || 0;
                 totalCandidatesTokens += usage.candidates_tokens || 0;
                 totalTokens += usage.total_tokens || 0;
+                totalCost += usage.cost || 0;
             }
 
             document.getElementById('total-calls').textContent = totalCalls.toLocaleString();
             document.getElementById('total-prompt-tokens').textContent = formatNumber(totalPromptTokens);
             document.getElementById('total-candidates-tokens').textContent = formatNumber(totalCandidatesTokens);
             document.getElementById('total-tokens').textContent = formatNumber(totalTokens);
+            
+            if (currentCurrency === 'CNY') {
+               document.getElementById('total-cost').textContent = `¥${(totalCost * USD_TO_CNY_RATE).toFixed(4)}`;
+            } else {
+               document.getElementById('total-cost').textContent = `$${totalCost.toFixed(4)}`;
+            }
         }
 
         function updateModelTable(data) {
@@ -303,17 +332,21 @@
                     count: usage.count,
                     promptTokens: usage.prompt_tokens || 0,
                     candidatesTokens: usage.candidates_tokens || 0,
-                    totalTokens: usage.total_tokens || 0
+                    totalTokens: usage.total_tokens || 0,
+                    cost: usage.cost || 0
                 });
             }
             stats.sort((a, b) => (b.date + a.model).localeCompare(a.date + b.model));
 
             if (stats.length === 0) {
-                tableBody.innerHTML = '<tr><td colspan="6">暂无数据</td></tr>';
+                tableBody.innerHTML = '<tr><td colspan="7">暂无数据</td></tr>';
             } else {
                 stats.forEach(stat => {
                     const row = document.createElement('tr');
-                    row.innerHTML = `<td>${stat.date}</td><td>${stat.model}</td><td>${stat.count}</td><td>${stat.promptTokens}</td><td>${stat.candidatesTokens}</td><td>${stat.totalTokens}</td>`;
+                    const costDisplay = currentCurrency === 'CNY'
+                       ? `¥${(stat.cost * USD_TO_CNY_RATE).toFixed(4)}`
+                       : `$${stat.cost.toFixed(4)}`;
+                    row.innerHTML = `<td>${stat.date}</td><td>${stat.model}</td><td>${stat.count}</td><td>${stat.promptTokens}</td><td>${stat.candidatesTokens}</td><td>${stat.totalTokens}</td><td>${costDisplay}</td>`;
                     tableBody.appendChild(row);
                 });
             }
@@ -568,6 +601,14 @@
                 document.getElementById('unit-toggle-btn').textContent = `单位: ${currentUnit}`;
                 updateTotalStats(lastModelData); // Re-render stats with the new unit
             });
+           document.getElementById('currency-toggle-btn').addEventListener('click', () => {
+               currentCurrency = currentCurrency === 'USD' ? 'CNY' : 'USD';
+               document.getElementById('currency-toggle-btn').textContent = `货币: ${currentCurrency}`;
+               document.getElementById('total-cost-title').textContent = `总费用 (${currentCurrency})`;
+               document.getElementById('cost-header').textContent = `费用 (${currentCurrency})`;
+               updateTotalStats(lastModelData); // Re-render stats with the new currency
+               updateModelTable(lastModelData); // Re-render table with the new currency
+           });
         }
 
         initCharts();

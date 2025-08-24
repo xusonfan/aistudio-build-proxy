@@ -39,10 +39,11 @@ var db *sql.DB
 
 // UsageData holds statistics for a given key.
 type UsageData struct {
-	Count            int64 `json:"count"`
-	PromptTokens     int64 `json:"prompt_tokens"`
-	CandidatesTokens int64 `json:"candidates_tokens"`
-	TotalTokens      int64 `json:"total_tokens"`
+	Count            int64   `json:"count"`
+	PromptTokens     int64   `json:"prompt_tokens"`
+	CandidatesTokens int64   `json:"candidates_tokens"`
+	TotalTokens      int64   `json:"total_tokens"`
+	Cost             float64 `json:"cost"`
 }
 
 // initDB 初始化数据库连接并创建表
@@ -60,6 +61,7 @@ func initDB() {
 		"prompt_tokens" BIGINT NOT NULL DEFAULT 0,
 		"candidates_tokens" BIGINT NOT NULL DEFAULT 0,
 		"total_tokens" BIGINT NOT NULL DEFAULT 0,
+		"cost" REAL NOT NULL DEFAULT 0.0,
 		PRIMARY KEY (model_name, date)
 	);`
 
@@ -68,6 +70,49 @@ func initDB() {
 		log.Fatalf("创建数据表失败: %v", err)
 	}
 	log.Println("数据库初始化成功。")
+}
+
+// --- Pricing ---
+
+type ModelPricing struct {
+	InputCost  float64 // Cost per 1 million input tokens
+	OutputCost float64 // Cost per 1 million output tokens
+}
+
+var pricing = map[string]ModelPricing{
+	"gemini-1.5-pro":          {InputCost: 1.25, OutputCost: 5.00},
+	"gemini-1.5-pro-latest":   {InputCost: 1.25, OutputCost: 5.00},
+	"gemini-pro":              {InputCost: 1.25, OutputCost: 5.00}, // Assume same as 1.5 pro
+	"gemini-1.5-flash":        {InputCost: 0.075, OutputCost: 0.30},
+	"gemini-1.5-flash-8b":     {InputCost: 0.0375, OutputCost: 0.15},
+	"gemini-1.5-flash-latest": {InputCost: 0.075, OutputCost: 0.30},
+	"gemini-2.5-pro":          {InputCost: 1.25, OutputCost: 10.00},
+	"gemini-2.5-flash":        {InputCost: 0.30, OutputCost: 2.50},
+	"gemini-2.5-flash-lite":   {InputCost: 0.10, OutputCost: 0.40},
+	"gemini-2.0-flash":        {InputCost: 0.10, OutputCost: 0.40},
+	"gemini-2.0-flash-lite":   {InputCost: 0.075, OutputCost: 0.30},
+}
+
+// calculateCost calculates the cost of a request.
+func calculateCost(modelName string, promptTokens, candidatesTokens int64) float64 {
+	modelPricing, ok := pricing[modelName]
+	if !ok {
+		// Fallback for models not in the pricing list (e.g., gemini-pro-vision)
+		// Try to find a base model price by removing the last part
+		parts := strings.Split(modelName, "-")
+		if len(parts) > 1 {
+			baseModel := strings.Join(parts[:len(parts)-1], "-")
+			modelPricing, ok = pricing[baseModel]
+		}
+		if !ok {
+			log.Printf("警告：找不到模型 '%s' 的定价信息", modelName)
+			return 0.0
+		}
+	}
+
+	inputCost := (float64(promptTokens) / 1000000) * modelPricing.InputCost
+	outputCost := (float64(candidatesTokens) / 1000000) * modelPricing.OutputCost
+	return inputCost + outputCost
 }
 
 // recordUsage 将使用次数和token数量增加到数据库中
@@ -84,15 +129,18 @@ func recordUsage(modelName string, usage *UsageMetadata) {
 		totalTokens = int64(usage.TotalTokenCount)
 	}
 
-	upsertSQL := `INSERT INTO usage_stats (model_name, date, count, prompt_tokens, candidates_tokens, total_tokens)
-	VALUES (?, ?, 1, ?, ?, ?)
+	cost := calculateCost(modelName, promptTokens, candidatesTokens)
+
+	upsertSQL := `INSERT INTO usage_stats (model_name, date, count, prompt_tokens, candidates_tokens, total_tokens, cost)
+	VALUES (?, ?, 1, ?, ?, ?, ?)
 	ON CONFLICT(model_name, date) DO UPDATE SET
 		count = count + 1,
 		prompt_tokens = prompt_tokens + excluded.prompt_tokens,
 		candidates_tokens = candidates_tokens + excluded.candidates_tokens,
-		total_tokens = total_tokens + excluded.total_tokens;`
+		total_tokens = total_tokens + excluded.total_tokens,
+		cost = cost + excluded.cost;`
 
-	_, err := db.Exec(upsertSQL, modelName, date, promptTokens, candidatesTokens, totalTokens)
+	_, err := db.Exec(upsertSQL, modelName, date, promptTokens, candidatesTokens, totalTokens, cost)
 	if err != nil {
 		log.Printf("记录使用情况到数据库时出错: %v", err)
 	}
@@ -1349,7 +1397,7 @@ var statsHTML []byte // 用于缓存 status.html 的内容
 
 // handleStats 以JSON格式返回当前的API使用统计数据
 func handleStats(w http.ResponseWriter, r *http.Request) {
-	rows, err := db.Query("SELECT model_name, date, count, prompt_tokens, candidates_tokens, total_tokens FROM usage_stats ORDER BY date, model_name")
+	rows, err := db.Query("SELECT model_name, date, count, prompt_tokens, candidates_tokens, total_tokens, cost FROM usage_stats ORDER BY date, model_name")
 	if err != nil {
 		log.Printf("从数据库查询统计数据时出错: %v", err)
 		http.Error(w, "无法查询统计数据", http.StatusInternalServerError)
@@ -1361,7 +1409,7 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var modelName, date string
 		var data UsageData
-		if err := rows.Scan(&modelName, &date, &data.Count, &data.PromptTokens, &data.CandidatesTokens, &data.TotalTokens); err != nil {
+		if err := rows.Scan(&modelName, &date, &data.Count, &data.PromptTokens, &data.CandidatesTokens, &data.TotalTokens, &data.Cost); err != nil {
 			log.Printf("扫描数据库行时出错: %v", err)
 			continue // 跳过此行
 		}
