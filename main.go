@@ -31,10 +31,18 @@ const (
 const statsFilename = "usage_stats.json"
 
 var (
-	// key: "modelName-YYYY-MM-DD", value: count
-	usageStats      = make(map[string]int64)
+	// key: "modelName-YYYY-MM-DD", value: UsageData
+	usageStats      = make(map[string]UsageData)
 	usageStatsMutex sync.RWMutex
 )
+
+// UsageData holds statistics for a given key.
+type UsageData struct {
+	Count            int64 `json:"count"`
+	PromptTokens     int64 `json:"prompt_tokens"`
+	CandidatesTokens int64 `json:"candidates_tokens"`
+	TotalTokens      int64 `json:"total_tokens"`
+}
 
 // loadStats 从文件中加载统计数据
 func loadStats() {
@@ -45,7 +53,7 @@ func loadStats() {
 	if err != nil {
 		if os.IsNotExist(err) {
 			log.Println("统计文件不存在, 将创建一个新的。")
-			usageStats = make(map[string]int64)
+			usageStats = make(map[string]UsageData)
 		} else {
 			log.Printf("加载统计文件时出错: %v", err)
 		}
@@ -55,7 +63,7 @@ func loadStats() {
 	if err := json.Unmarshal(data, &usageStats); err != nil {
 		log.Printf("解析统计文件时出错: %v", err)
 		// 如果文件损坏，则从一个空的map开始
-		usageStats = make(map[string]int64)
+		usageStats = make(map[string]UsageData)
 	}
 	log.Printf("成功从 %s 加载了 %d 条统计记录。", statsFilename, len(usageStats))
 }
@@ -64,7 +72,7 @@ func loadStats() {
 func saveStats() {
 	usageStatsMutex.RLock()
 	// 复制map以最小化锁的持有时间
-	statsCopy := make(map[string]int64, len(usageStats))
+	statsCopy := make(map[string]UsageData, len(usageStats))
 	for k, v := range usageStats {
 		statsCopy[k] = v
 	}
@@ -88,8 +96,8 @@ func saveStats() {
 	log.Printf("已将统计数据持久化到 %s", statsFilename)
 }
 
-// recordUsage increments the usage count for a given model.
-func recordUsage(modelName string) {
+// recordUsage increments the usage count and token counts for a given model.
+func recordUsage(modelName string, usage *UsageMetadata) {
 	// Sanitize model name to avoid issues with path separators etc.
 	// e.g. "gemini-1.5-pro-latest"
 	if modelName == "" {
@@ -101,8 +109,16 @@ func recordUsage(modelName string) {
 	usageStatsMutex.Lock()
 	defer usageStatsMutex.Unlock()
 
-	usageStats[key]++
-	log.Printf("Recorded usage for model %s. Total for today: %d", modelName, usageStats[key])
+	stats := usageStats[key] // Get current stats, will be zero-value if not present
+	stats.Count++
+	if usage != nil {
+		stats.PromptTokens += int64(usage.PromptTokenCount)
+		stats.CandidatesTokens += int64(usage.CandidatesTokenCount)
+		stats.TotalTokens += int64(usage.TotalTokenCount)
+	}
+	usageStats[key] = stats // Write back the updated struct
+
+	log.Printf("Recorded usage for model %s. Total calls today: %d, Total tokens today: %d", modelName, stats.Count, stats.TotalTokens)
 }
 
 // recordErrorRequest 记录一个非200的HTTP请求
@@ -117,8 +133,10 @@ func recordErrorRequest(statusCode int) {
 	usageStatsMutex.Lock()
 	defer usageStatsMutex.Unlock()
 
-	usageStats[key]++
-	log.Printf("记录到非200请求: StatusCode=%d. 今日总计: %d", statusCode, usageStats[key])
+	stats := usageStats[key]
+	stats.Count++
+	usageStats[key] = stats
+	log.Printf("记录到非200请求: StatusCode=%d. 今日总计: %d", statusCode, stats.Count)
 }
 
 // --- Gemini API Structs ---
@@ -696,6 +714,7 @@ func processWebSocketResponse(w http.ResponseWriter, r *http.Request, respChan c
 		log.Println("Warning: ResponseWriter does not support flushing, streaming will be buffered.")
 	}
 
+	var lastUsage *UsageMetadata // 暂存最后一个有效的 usage metadata
 	headersSet := false
 
 	// 处理已经收到的初始成功消息
@@ -712,7 +731,16 @@ func processWebSocketResponse(w http.ResponseWriter, r *http.Request, respChan c
 				statusCode = int(status)
 			}
 			if statusCode == http.StatusOK && modelName != "" {
-				recordUsage(modelName)
+				var usage *UsageMetadata
+				if body, ok := msg.Payload["body"].(string); ok {
+					var geminiResp GeminiResponse
+					if err := json.Unmarshal([]byte(body), &geminiResp); err == nil {
+						usage = &geminiResp.UsageMetadata
+					} else {
+						log.Printf("Could not unmarshal gemini response for token usage: %v", err)
+					}
+				}
+				recordUsage(modelName, usage)
 			}
 			setResponseHeaders(w, msg.Payload)
 			w.WriteHeader(statusCode)
@@ -737,6 +765,19 @@ func processWebSocketResponse(w http.ResponseWriter, r *http.Request, respChan c
 				w.WriteHeader(http.StatusOK)
 				headersSet = true
 			}
+			// 尝试解析 token usage
+			if data, ok := msg.Payload["data"].(string); ok {
+				bodyStr := data
+				if strings.HasPrefix(bodyStr, "data: ") {
+					bodyStr = strings.TrimPrefix(bodyStr, "data: ")
+				}
+				var geminiResp GeminiResponse
+				if err := json.Unmarshal([]byte(bodyStr), &geminiResp); err == nil {
+					if geminiResp.UsageMetadata.TotalTokenCount > 0 {
+						lastUsage = &geminiResp.UsageMetadata
+					}
+				}
+			}
 			writeBody(w, msg.Payload)
 			if flusher != nil {
 				flusher.Flush()
@@ -744,7 +785,7 @@ func processWebSocketResponse(w http.ResponseWriter, r *http.Request, respChan c
 
 		case "stream_end":
 			if modelName != "" {
-				recordUsage(modelName)
+				recordUsage(modelName, lastUsage) // 使用暂存的 usage
 			}
 			if !headersSet {
 				w.WriteHeader(http.StatusOK)
@@ -1083,7 +1124,7 @@ func handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 只有成功时才记录
-	recordUsage("models-list") // 使用一个固定的名称来记录模型列表的调用
+	recordUsage("models-list", nil) // 使用一个固定的名称来记录模型列表的调用
 
 	// Handle non-streaming response
 	var geminiResp GeminiModelListResponse
@@ -1195,6 +1236,8 @@ func handleOpenAIProxy(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), proxyRequestTimeout)
 		defer cancel()
 
+		var lastUsage *UsageMetadata // 在循环外定义
+
 		for {
 			select {
 			case msg, ok := <-respChan:
@@ -1227,6 +1270,11 @@ func handleOpenAIProxy(w http.ResponseWriter, r *http.Request) {
 						continue
 					}
 
+					// 暂存 usage metadata
+					if geminiResp.UsageMetadata.TotalTokenCount > 0 {
+						lastUsage = &geminiResp.UsageMetadata
+					}
+
 					if len(geminiResp.Candidates) > 0 && len(geminiResp.Candidates[0].Content.Parts) > 0 {
 						openAIChunk := OpenAIStreamResponse{
 							ID:      "chatcmpl-" + uuid.NewString(),
@@ -1253,7 +1301,7 @@ func handleOpenAIProxy(w http.ResponseWriter, r *http.Request) {
 					}
 
 				case "stream_end":
-					recordUsage(openAIReq.Model)
+					recordUsage(openAIReq.Model, lastUsage) // 使用暂存的 usage
 					fmt.Fprintf(w, "data: [DONE]\n\n")
 					flusher.Flush()
 					return
@@ -1288,14 +1336,13 @@ func handleOpenAIProxy(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// 只有成功时才记录
-		recordUsage(openAIReq.Model)
-
 		var geminiResp GeminiResponse
 		if err := json.NewDecoder(recorder.Body).Decode(&geminiResp); err != nil {
 			recordErrorRequest(http.StatusInternalServerError)
 			http.Error(w, "Failed to decode gemini response: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
+		recordUsage(openAIReq.Model, &geminiResp.UsageMetadata)
 
 		openAIResp := convertGeminiToOpenAI(&geminiResp, openAIReq.Model)
 		w.Header().Set("Content-Type", "application/json")
@@ -1313,7 +1360,7 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 	defer usageStatsMutex.RUnlock()
 
 	// 为了避免在JSON编码期间长时间持有锁，我们复制map
-	statsCopy := make(map[string]int64, len(usageStats))
+	statsCopy := make(map[string]UsageData, len(usageStats))
 	for k, v := range usageStats {
 		statsCopy[k] = v
 	}
