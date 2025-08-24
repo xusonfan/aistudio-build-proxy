@@ -145,6 +145,7 @@
         <div id="pie-chart-container" class="chart-container"></div>
         <div id="error-chart-container" class="chart-container"></div>
         <div id="token-chart-container" class="chart-container"></div>
+        <div id="daily-cost-pie-chart-container" class="chart-container"></div>
     </div>
 
     <div class="stats-section">
@@ -198,25 +199,30 @@
         const pieChartDom = document.getElementById('pie-chart-container');
         const errorChartDom = document.getElementById('error-chart-container');
         const tokenChartDom = document.getElementById('token-chart-container');
+        const dailyCostPieChartDom = document.getElementById('daily-cost-pie-chart-container');
         const myBarChart = echarts.init(barChartDom);
         const myPieChart = echarts.init(pieChartDom);
         const myErrorChart = echarts.init(errorChartDom);
         const myTokenChart = echarts.init(tokenChartDom);
+        const myDailyCostPieChart = echarts.init(dailyCostPieChartDom);
         const dateRangeSelector = document.getElementById('date-range-selector');
 
         async function fetchData() {
             // Fetch stats and connections in parallel
             try {
-                const [statsResponse, connsResponse] = await Promise.all([
+                const [statsResponse, connsResponse, todayCostResponse] = await Promise.all([
                     fetch('/stats'),
-                    fetch('/connections')
+                    fetch('/connections'),
+                    fetch('/stats/today_cost')
                 ]);
 
                 if (!statsResponse.ok) throw new Error('Stats network response was not ok');
                 if (!connsResponse.ok) throw new Error('Connections network response was not ok');
+                if (!todayCostResponse.ok) throw new Error('Today cost network response was not ok');
 
                 const rawData = await statsResponse.json();
                 const connsData = await connsResponse.json();
+                const todayCostData = await todayCostResponse.json();
 
                 // Process and update stats
                 const { modelData, errorData } = processAndFilterData(rawData);
@@ -227,6 +233,7 @@
                 updateErrorTable(errorData);
                 updateErrorBarChart(errorData);
                 updateTokenBarChart(modelData);
+                updateDailyCostPieChart(todayCostData);
 
                 // Update connections table
                 updateConnectionsTable(connsData);
@@ -242,6 +249,7 @@
                 myPieChart.showLoading('default', { text: '加载数据失败' });
                 myErrorChart.showLoading('default', { text: '加载数据失败' });
                 myTokenChart.showLoading('default', { text: '加载数据失败' });
+                myDailyCostPieChart.showLoading('default', { text: '加载数据失败' });
             }
         }
 
@@ -542,7 +550,62 @@
             myPieChart.resize();
             myErrorChart.resize();
             myTokenChart.resize();
+            myDailyCostPieChart.resize();
         });
+
+        function updateDailyCostPieChart(data) {
+            const pieData = data.map(item => ({
+                name: item.model_name,
+                value: item.cost
+            }));
+
+            const totalCost = pieData.reduce((sum, item) => sum + item.value, 0);
+            const costDisplay = currentCurrency === 'CNY'
+                ? `¥${(totalCost * USD_TO_CNY_RATE).toFixed(4)}`
+                : `$${totalCost.toFixed(4)}`;
+
+            const option = {
+                title: {
+                    text: '今日费用消耗占比',
+                    subtext: `总计: ${costDisplay}`,
+                    left: 'center'
+                },
+                tooltip: {
+                    trigger: 'item',
+                    formatter: (params) => {
+                        const cost = params.value;
+                        const displayCost = currentCurrency === 'CNY'
+                            ? `¥${(cost * USD_TO_CNY_RATE).toFixed(4)}`
+                            : `$${cost.toFixed(4)}`;
+                        return `${params.seriesName}<br/>${params.name}: ${displayCost} (${params.percent}%)`;
+                    }
+                },
+                legend: {
+                    top: 'bottom'
+                },
+                series: [{
+                    name: '模型',
+                    type: 'pie',
+                    radius: '65%',
+                    center: ['50%', '55%'],
+                    data: pieData,
+                    emphasis: {
+                        itemStyle: {
+                            shadowBlur: 10,
+                            shadowOffsetX: 0,
+                            shadowColor: 'rgba(0, 0, 0, 0.5)'
+                        }
+                    }
+                }]
+            };
+
+            if (pieData.length === 0) {
+                myDailyCostPieChart.showLoading('default', { text: '今日暂无费用' });
+            } else {
+                myDailyCostPieChart.hideLoading();
+                myDailyCostPieChart.setOption(option, true);
+            }
+        }
 
         function updateTokenBarChart(data) {
             const allDates = new Set();
@@ -593,6 +656,7 @@
             myPieChart.showLoading('default', { text: '正在加载数据...' });
             myErrorChart.showLoading('default', { text: '正在加载数据...' });
             myTokenChart.showLoading('default', { text: '正在加载数据...' });
+            myDailyCostPieChart.showLoading('default', { text: '正在加载数据...' });
             fetchData();
             setInterval(fetchData, 5000);
             dateRangeSelector.addEventListener('change', fetchData);
@@ -608,8 +672,10 @@
                document.getElementById('cost-header').textContent = `费用 (${currentCurrency})`;
                updateTotalStats(lastModelData); // Re-render stats with the new currency
                updateModelTable(lastModelData); // Re-render table with the new currency
+               // Refetch and redraw the daily cost pie chart as it depends on currency
+               fetch('/stats/today_cost').then(res => res.json()).then(updateDailyCostPieChart);
            });
-        }
+       }
 
         initCharts();
     </script>

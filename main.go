@@ -1465,6 +1465,46 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// DailyCostStat holds cost per model for a specific day.
+type DailyCostStat struct {
+	ModelName string  `json:"model_name"`
+	Cost      float64 `json:"cost"`
+}
+
+// handleTodayCostStats 以JSON格式返回当天各模型的费用消耗
+func handleTodayCostStats(w http.ResponseWriter, r *http.Request) {
+	date := time.Now().In(cstZone).Format("2006-01-02")
+	rows, err := db.Query("SELECT model_name, cost FROM usage_stats WHERE date = ? AND cost > 0 ORDER BY cost DESC", date)
+	if err != nil {
+		log.Printf("从数据库查询今日费用统计数据时出错: %v", err)
+		http.Error(w, "无法查询今日费用统计数据", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var stats []DailyCostStat
+	for rows.Next() {
+		var stat DailyCostStat
+		if err := rows.Scan(&stat.ModelName, &stat.Cost); err != nil {
+			log.Printf("扫描数据库行时出错: %v", err)
+			continue
+		}
+		stats = append(stats, stat)
+	}
+
+	if err := rows.Err(); err != nil {
+		log.Printf("遍历数据库行时出错: %v", err)
+		http.Error(w, "遍历今日费用统计数据时出错", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(stats); err != nil {
+		log.Printf("序列化今日费用统计数据时出错: %v", err)
+		http.Error(w, "无法序列化今日费用统计数据", http.StatusInternalServerError)
+	}
+}
+
 // --- 主函数 ---
 
 func main() {
@@ -1505,6 +1545,7 @@ func main() {
 	// API 统计路由
 	mux.HandleFunc("/stats", handleStats)
 	mux.HandleFunc("/connections", handleConnections)
+	mux.HandleFunc("/stats/today_cost", handleTodayCostStats)
 	// 根路由和静态文件服务
 	// 创建一个文件服务器，为当前目录下的文件提供服务
 	fs := http.FileServer(http.Dir("."))
