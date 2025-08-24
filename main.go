@@ -226,6 +226,21 @@ type OpenAIStreamResponse struct {
 	Choices []OpenAIStreamChoice `json:"choices"`
 }
 
+// --- Connection Status Structs ---
+
+// ConnectionInfo holds details about a single client connection for status reporting.
+type ConnectionInfo struct {
+	RemoteAddr string    `json:"remote_addr"`
+	LastActive time.Time `json:"last_active"`
+	Healthy    bool      `json:"healthy"`
+}
+
+// UserConnectionStatus holds the status for all connections of a single user.
+type UserConnectionStatus struct {
+	ConnectionCount int              `json:"connection_count"`
+	Connections     []ConnectionInfo `json:"connections"`
+}
+
 // --- 1. 连接管理与负载均衡 ---
 
 // UserConnection 存储单个WebSocket连接及其元数据
@@ -1365,6 +1380,40 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleConnections returns the current WebSocket connection status.
+func handleConnections(w http.ResponseWriter, r *http.Request) {
+	globalPool.RLock()
+	defer globalPool.RUnlock()
+
+	status := make(map[string]UserConnectionStatus)
+
+	for userID, userConns := range globalPool.Users {
+		userConns.Lock() // Lock individual user's connections
+
+		connInfos := make([]ConnectionInfo, 0, len(userConns.Connections))
+		for _, conn := range userConns.Connections {
+			connInfos = append(connInfos, ConnectionInfo{
+				RemoteAddr: conn.Conn.RemoteAddr().String(),
+				LastActive: conn.LastActive,
+				Healthy:    conn.Healthy,
+			})
+		}
+
+		status[userID] = UserConnectionStatus{
+			ConnectionCount: len(userConns.Connections),
+			Connections:     connInfos,
+		}
+
+		userConns.Unlock()
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(status); err != nil {
+		log.Printf("序列化连接状态时出错: %v", err)
+		http.Error(w, "无法序列化连接状态", http.StatusInternalServerError)
+	}
+}
+
 // --- 主函数 ---
 
 func main() {
@@ -1404,6 +1453,7 @@ func main() {
 
 	// API 统计路由
 	mux.HandleFunc("/stats", handleStats)
+	mux.HandleFunc("/connections", handleConnections)
 	// 根路由和静态文件服务
 	// 创建一个文件服务器，为当前目录下的文件提供服务
 	fs := http.FileServer(http.Dir("."))

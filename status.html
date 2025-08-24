@@ -82,6 +82,8 @@
         #total-stats-container {
             position: relative;
         }
+        .status-healthy { color: #28a745; font-weight: bold; }
+        .status-unhealthy { color: #dc3545; font-weight: bold; }
     </style>
     <!-- 引入 ECharts -->
     <script src="echarts.min.js"></script>
@@ -132,6 +134,20 @@
     </div>
 
     <div class="stats-section">
+        <h2>当前连接状态</h2>
+        <table id="connections-table">
+            <thead>
+                <tr>
+                    <th>用户 ID</th>
+                    <th>连接数</th>
+                    <th>客户端详情 (IP 地址 | 最后活跃 | 状态)</th>
+                </tr>
+            </thead>
+            <tbody></tbody>
+        </table>
+    </div>
+
+    <div class="stats-section">
         <h2>模型调用详细数据</h2>
         <table id="stats-table">
             <thead>
@@ -173,28 +189,40 @@
         const myTokenChart = echarts.init(tokenChartDom);
         const dateRangeSelector = document.getElementById('date-range-selector');
 
-        async function fetchStats() {
+        async function fetchData() {
+            // Fetch stats and connections in parallel
             try {
-                const response = await fetch('/stats');
-                if (!response.ok) throw new Error('Network response was not ok');
-                const rawData = await response.json();
+                const [statsResponse, connsResponse] = await Promise.all([
+                    fetch('/stats'),
+                    fetch('/connections')
+                ]);
 
+                if (!statsResponse.ok) throw new Error('Stats network response was not ok');
+                if (!connsResponse.ok) throw new Error('Connections network response was not ok');
+
+                const rawData = await statsResponse.json();
+                const connsData = await connsResponse.json();
+
+                // Process and update stats
                 const { modelData, errorData } = processAndFilterData(rawData);
-
                 updateTotalStats(modelData);
                 updateModelTable(modelData);
                 updateModelBarChart(modelData);
                 updateModelPieChart(modelData);
-                
                 updateErrorTable(errorData);
                 updateErrorBarChart(errorData);
                 updateTokenBarChart(modelData);
 
+                // Update connections table
+                updateConnectionsTable(connsData);
 
             } catch (error) {
-                console.error('获取统计数据时出错:', error);
+                console.error('获取数据时出错:', error);
+                // Update tables to show error state
                 document.querySelector('#stats-table tbody').innerHTML = '<tr><td colspan="6">加载统计数据失败.</td></tr>';
                 document.querySelector('#error-stats-table tbody').innerHTML = '<tr><td colspan="3">加载统计数据失败.</td></tr>';
+                document.querySelector('#connections-table tbody').innerHTML = '<tr><td colspan="3">加载连接数据失败.</td></tr>';
+                // Update charts to show error state
                 myBarChart.showLoading('default', { text: '加载数据失败' });
                 myPieChart.showLoading('default', { text: '加载数据失败' });
                 myErrorChart.showLoading('default', { text: '加载数据失败' });
@@ -447,6 +475,37 @@
                 myErrorChart.setOption(option, true);
             }
         }
+
+        function updateConnectionsTable(data) {
+            const tableBody = document.querySelector('#connections-table tbody');
+            tableBody.innerHTML = '';
+
+            const userIDs = Object.keys(data);
+
+            if (userIDs.length === 0) {
+                tableBody.innerHTML = '<tr><td colspan="3">当前没有活动的连接</td></tr>';
+                return;
+            }
+
+            userIDs.sort().forEach(userID => {
+                const userData = data[userID];
+                const row = document.createElement('tr');
+
+                const detailsList = userData.connections.map(conn => {
+                    const statusClass = conn.healthy ? 'status-healthy' : 'status-unhealthy';
+                    const statusText = conn.healthy ? '健康' : '不健康';
+                    const lastActive = new Date(conn.last_active).toLocaleString();
+                    return `<li>${conn.remote_addr} | ${lastActive} | <span class="${statusClass}">${statusText}</span></li>`;
+                }).join('');
+
+                row.innerHTML = `
+                    <td>${userID}</td>
+                    <td>${userData.connection_count}</td>
+                    <td><ul style="margin: 0; padding-left: 20px;">${detailsList}</ul></td>
+                `;
+                tableBody.appendChild(row);
+            });
+        }
         
         window.addEventListener('resize', () => {
             myBarChart.resize();
@@ -504,9 +563,9 @@
             myPieChart.showLoading('default', { text: '正在加载数据...' });
             myErrorChart.showLoading('default', { text: '正在加载数据...' });
             myTokenChart.showLoading('default', { text: '正在加载数据...' });
-            fetchStats();
-            setInterval(fetchStats, 5000);
-            dateRangeSelector.addEventListener('change', fetchStats);
+            fetchData();
+            setInterval(fetchData, 5000);
+            dateRangeSelector.addEventListener('change', fetchData);
             document.getElementById('unit-toggle-btn').addEventListener('click', () => {
                 currentUnit = currentUnit === 'K' ? 'M' : 'K';
                 document.getElementById('unit-toggle-btn').textContent = `单位: ${currentUnit}`;
