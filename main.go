@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	_ "modernc.org/sqlite" // Import the pure Go sqlite3 driver
 )
 
 // --- Constants ---
@@ -28,13 +30,9 @@ const (
 
 // --- API Usage Statistics ---
 
-const statsFilename = "usage_stats.json"
+const dbFilename = "usage_stats.db"
 
-var (
-	// key: "modelName-YYYY-MM-DD", value: UsageData
-	usageStats      = make(map[string]UsageData)
-	usageStatsMutex sync.RWMutex
-)
+var db *sql.DB
 
 // UsageData holds statistics for a given key.
 type UsageData struct {
@@ -44,99 +42,76 @@ type UsageData struct {
 	TotalTokens      int64 `json:"total_tokens"`
 }
 
-// loadStats 从文件中加载统计数据
-func loadStats() {
-	usageStatsMutex.Lock()
-	defer usageStatsMutex.Unlock()
-
-	data, err := os.ReadFile(statsFilename)
+// initDB 初始化数据库连接并创建表
+func initDB() {
+	var err error
+	db, err = sql.Open("sqlite", dbFilename)
 	if err != nil {
-		if os.IsNotExist(err) {
-			log.Println("统计文件不存在, 将创建一个新的。")
-			usageStats = make(map[string]UsageData)
-		} else {
-			log.Printf("加载统计文件时出错: %v", err)
-		}
-		return
+		log.Fatalf("打开数据库失败: %v", err)
 	}
 
-	if err := json.Unmarshal(data, &usageStats); err != nil {
-		log.Printf("解析统计文件时出错: %v", err)
-		// 如果文件损坏，则从一个空的map开始
-		usageStats = make(map[string]UsageData)
+	createTableSQL := `CREATE TABLE IF NOT EXISTS usage_stats (
+		"model_name" TEXT NOT NULL,
+		"date" TEXT NOT NULL,
+		"count" BIGINT NOT NULL DEFAULT 0,
+		"prompt_tokens" BIGINT NOT NULL DEFAULT 0,
+		"candidates_tokens" BIGINT NOT NULL DEFAULT 0,
+		"total_tokens" BIGINT NOT NULL DEFAULT 0,
+		PRIMARY KEY (model_name, date)
+	);`
+
+	_, err = db.Exec(createTableSQL)
+	if err != nil {
+		log.Fatalf("创建数据表失败: %v", err)
 	}
-	log.Printf("成功从 %s 加载了 %d 条统计记录。", statsFilename, len(usageStats))
+	log.Println("数据库初始化成功。")
 }
 
-// saveStats 将统计数据保存到文件
-func saveStats() {
-	usageStatsMutex.RLock()
-	// 复制map以最小化锁的持有时间
-	statsCopy := make(map[string]UsageData, len(usageStats))
-	for k, v := range usageStats {
-		statsCopy[k] = v
-	}
-	usageStatsMutex.RUnlock()
-
-	data, err := json.MarshalIndent(statsCopy, "", "  ")
-	if err != nil {
-		log.Printf("序列化统计数据时出错: %v", err)
-		return
-	}
-
-	// 原子写入：先写入临时文件，然后重命名
-	tempFilename := statsFilename + ".tmp"
-	if err := os.WriteFile(tempFilename, data, 0644); err != nil {
-		log.Printf("写入临时统计文件时出错: %v", err)
-		return
-	}
-	if err := os.Rename(tempFilename, statsFilename); err != nil {
-		log.Printf("重命名统计文件时出错: %v", err)
-	}
-	log.Printf("已将统计数据持久化到 %s", statsFilename)
-}
-
-// recordUsage increments the usage count and token counts for a given model.
+// recordUsage 将使用次数和token数量增加到数据库中
 func recordUsage(modelName string, usage *UsageMetadata) {
-	// Sanitize model name to avoid issues with path separators etc.
-	// e.g. "gemini-1.5-pro-latest"
 	if modelName == "" {
 		return
 	}
 	date := time.Now().UTC().Format("2006-01-02")
-	key := fmt.Sprintf("%s-%s", modelName, date)
 
-	usageStatsMutex.Lock()
-	defer usageStatsMutex.Unlock()
-
-	stats := usageStats[key] // Get current stats, will be zero-value if not present
-	stats.Count++
+	var promptTokens, candidatesTokens, totalTokens int64
 	if usage != nil {
-		stats.PromptTokens += int64(usage.PromptTokenCount)
-		stats.CandidatesTokens += int64(usage.CandidatesTokenCount)
-		stats.TotalTokens += int64(usage.TotalTokenCount)
+		promptTokens = int64(usage.PromptTokenCount)
+		candidatesTokens = int64(usage.CandidatesTokenCount)
+		totalTokens = int64(usage.TotalTokenCount)
 	}
-	usageStats[key] = stats // Write back the updated struct
 
-	log.Printf("Recorded usage for model %s. Total calls today: %d, Total tokens today: %d", modelName, stats.Count, stats.TotalTokens)
+	upsertSQL := `INSERT INTO usage_stats (model_name, date, count, prompt_tokens, candidates_tokens, total_tokens)
+	VALUES (?, ?, 1, ?, ?, ?)
+	ON CONFLICT(model_name, date) DO UPDATE SET
+		count = count + 1,
+		prompt_tokens = prompt_tokens + excluded.prompt_tokens,
+		candidates_tokens = candidates_tokens + excluded.candidates_tokens,
+		total_tokens = total_tokens + excluded.total_tokens;`
+
+	_, err := db.Exec(upsertSQL, modelName, date, promptTokens, candidatesTokens, totalTokens)
+	if err != nil {
+		log.Printf("记录使用情况到数据库时出错: %v", err)
+	}
 }
 
-// recordErrorRequest 记录一个非200的HTTP请求
+// recordErrorRequest 记录一个非200的HTTP请求到数据库
 func recordErrorRequest(statusCode int) {
-	// 我们记录任何非200 OK的状态码
 	if statusCode == http.StatusOK {
 		return
 	}
 	date := time.Now().UTC().Format("2006-01-02")
-	key := fmt.Sprintf("error-status-%d-%s", statusCode, date)
+	modelName := fmt.Sprintf("error-status-%d", statusCode)
 
-	usageStatsMutex.Lock()
-	defer usageStatsMutex.Unlock()
+	upsertSQL := `INSERT INTO usage_stats (model_name, date, count)
+	VALUES (?, ?, 1)
+	ON CONFLICT(model_name, date) DO UPDATE SET
+		count = count + 1;`
 
-	stats := usageStats[key]
-	stats.Count++
-	usageStats[key] = stats
-	log.Printf("记录到非200请求: StatusCode=%d. 今日总计: %d", statusCode, stats.Count)
+	_, err := db.Exec(upsertSQL, modelName, date)
+	if err != nil {
+		log.Printf("记录错误请求到数据库时出错: %v", err)
+	}
 }
 
 // --- Gemini API Structs ---
@@ -1356,19 +1331,36 @@ var statsHTML []byte // 用于缓存 status.html 的内容
 
 // handleStats 以JSON格式返回当前的API使用统计数据
 func handleStats(w http.ResponseWriter, r *http.Request) {
-	usageStatsMutex.RLock()
-	defer usageStatsMutex.RUnlock()
+	rows, err := db.Query("SELECT model_name, date, count, prompt_tokens, candidates_tokens, total_tokens FROM usage_stats ORDER BY date, model_name")
+	if err != nil {
+		log.Printf("从数据库查询统计数据时出错: %v", err)
+		http.Error(w, "无法查询统计数据", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
 
-	// 为了避免在JSON编码期间长时间持有锁，我们复制map
-	statsCopy := make(map[string]UsageData, len(usageStats))
-	for k, v := range usageStats {
-		statsCopy[k] = v
+	statsCopy := make(map[string]UsageData)
+	for rows.Next() {
+		var modelName, date string
+		var data UsageData
+		if err := rows.Scan(&modelName, &date, &data.Count, &data.PromptTokens, &data.CandidatesTokens, &data.TotalTokens); err != nil {
+			log.Printf("扫描数据库行时出错: %v", err)
+			continue // 跳过此行
+		}
+		// 为了与前端兼容，重新组合成旧的key格式
+		key := fmt.Sprintf("%s-%s", modelName, date)
+		statsCopy[key] = data
+	}
+
+	if err := rows.Err(); err != nil {
+		log.Printf("遍历数据库行时出错: %v", err)
+		http.Error(w, "遍历统计数据时出错", http.StatusInternalServerError)
+		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(statsCopy); err != nil {
 		log.Printf("序列化统计数据时出错: %v", err)
-		recordErrorRequest(http.StatusInternalServerError)
 		http.Error(w, "无法序列化统计数据", http.StatusInternalServerError)
 	}
 }
@@ -1383,17 +1375,9 @@ func main() {
 		log.Fatalf("无法读取 status.html: %v", err)
 	}
 
-	// 加载持久化的统计数据
-	loadStats()
-
-	// 启动一个goroutine来定期保存统计数据
-	go func() {
-		ticker := time.NewTicker(1 * time.Minute) // 每分钟保存一次
-		defer ticker.Stop()
-		for range ticker.C {
-			saveStats()
-		}
-	}()
+	// 初始化数据库
+	initDB()
+	defer db.Close()
 
 	// 启动一个goroutine来定期恢复不健康的连接
 	go func() {
