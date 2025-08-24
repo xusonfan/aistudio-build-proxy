@@ -28,6 +28,9 @@ const (
 	proxyRequestTimeout = 600 * time.Second
 )
 
+// --- Timezone ---
+var cstZone, _ = time.LoadLocation("Asia/Shanghai") // 中国标准时间
+
 // --- API Usage Statistics ---
 
 const dbFilename = "usage_stats.db"
@@ -72,7 +75,7 @@ func recordUsage(modelName string, usage *UsageMetadata) {
 	if modelName == "" {
 		return
 	}
-	date := time.Now().UTC().Format("2006-01-02")
+	date := time.Now().In(cstZone).Format("2006-01-02")
 
 	var promptTokens, candidatesTokens, totalTokens int64
 	if usage != nil {
@@ -100,7 +103,7 @@ func recordErrorRequest(statusCode int) {
 	if statusCode == http.StatusOK {
 		return
 	}
-	date := time.Now().UTC().Format("2006-01-02")
+	date := time.Now().In(cstZone).Format("2006-01-02")
 	modelName := fmt.Sprintf("error-status-%d", statusCode)
 
 	upsertSQL := `INSERT INTO usage_stats (model_name, date, count)
