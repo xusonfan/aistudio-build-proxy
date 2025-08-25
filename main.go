@@ -74,31 +74,36 @@ func initDB() {
 
 // --- Pricing ---
 
+// PriceTier 定义了特定token阈值下的价格
+type PriceTier struct {
+	Threshold  int64   // Token 数量阈值 (大于该值时应用此价格)
+	InputCost  float64 // 每100万输入token的成本
+	OutputCost float64 // 每100万输出token的成本
+}
+
+// ModelPricing 包含一个模型的所有价格层级，按阈值从低到高排序
 type ModelPricing struct {
-	InputCost  float64 // Cost per 1 million input tokens
-	OutputCost float64 // Cost per 1 million output tokens
+	Tiers []PriceTier
 }
 
 var pricing = map[string]ModelPricing{
-	"gemini-1.5-pro":          {InputCost: 1.25, OutputCost: 5.00},
-	"gemini-1.5-pro-latest":   {InputCost: 1.25, OutputCost: 5.00},
-	"gemini-pro":              {InputCost: 1.25, OutputCost: 5.00}, // Assume same as 1.5 pro
-	"gemini-1.5-flash":        {InputCost: 0.075, OutputCost: 0.30},
-	"gemini-1.5-flash-8b":     {InputCost: 0.0375, OutputCost: 0.15},
-	"gemini-1.5-flash-latest": {InputCost: 0.075, OutputCost: 0.30},
-	"gemini-2.5-pro":          {InputCost: 1.25, OutputCost: 10.00},
-	"gemini-2.5-flash":        {InputCost: 0.30, OutputCost: 2.50},
-	"gemini-2.5-flash-lite":   {InputCost: 0.10, OutputCost: 0.40},
-	"gemini-2.0-flash":        {InputCost: 0.10, OutputCost: 0.40},
-	"gemini-2.0-flash-lite":   {InputCost: 0.075, OutputCost: 0.30},
+	// --- Models with Tiered Pricing ---
+	"gemini-2.5-pro": {Tiers: []PriceTier{
+		{Threshold: 200000, InputCost: 2.50, OutputCost: 15.00},
+		{Threshold: 0, InputCost: 1.25, OutputCost: 10.00},
+	}},
+
+	// --- Models with Flat Pricing ---
+	"gemini-pro":            {Tiers: []PriceTier{{Threshold: 0, InputCost: 1.25, OutputCost: 5.00}}}, // Assume same as 1.5 pro base
+	"gemini-2.5-flash":      {Tiers: []PriceTier{{Threshold: 0, InputCost: 0.30, OutputCost: 2.50}}},
+	"gemini-2.5-flash-lite": {Tiers: []PriceTier{{Threshold: 0, InputCost: 0.10, OutputCost: 0.40}}},
 }
 
-// calculateCost calculates the cost of a request.
+// calculateCost 根据模型的定价层级计算请求成本
 func calculateCost(modelName string, promptTokens, candidatesTokens int64) float64 {
 	modelPricing, ok := pricing[modelName]
 	if !ok {
-		// Fallback for models not in the pricing list (e.g., gemini-pro-vision)
-		// Try to find a base model price by removing the last part
+		// 回退机制：对于不在列表中的模型（例如 gemini-pro-vision），尝试通过移除最后一个部分来查找基础模型价格
 		parts := strings.Split(modelName, "-")
 		if len(parts) > 1 {
 			baseModel := strings.Join(parts[:len(parts)-1], "-")
@@ -110,8 +115,22 @@ func calculateCost(modelName string, promptTokens, candidatesTokens int64) float
 		}
 	}
 
-	inputCost := (float64(promptTokens) / 1000000) * modelPricing.InputCost
-	outputCost := (float64(candidatesTokens) / 1000000) * modelPricing.OutputCost
+	// 根据 promptTokens 确定价格层级
+	// 价格按阈值从高到低排序，因此第一个匹配的即为正确层级
+	var selectedTier PriceTier
+	for _, tier := range modelPricing.Tiers {
+		if promptTokens > tier.Threshold {
+			selectedTier = tier
+			break
+		}
+	}
+	// 如果循环后仍未选择（例如 promptTokens 正好等于或小于最低阈值），则选择最后一个层级（阈值为0的层级）
+	if selectedTier.Threshold == 0 && len(modelPricing.Tiers) > 0 {
+		selectedTier = modelPricing.Tiers[len(modelPricing.Tiers)-1]
+	}
+
+	inputCost := (float64(promptTokens) / 1000000) * selectedTier.InputCost
+	outputCost := (float64(candidatesTokens) / 1000000) * selectedTier.OutputCost
 	return inputCost + outputCost
 }
 
