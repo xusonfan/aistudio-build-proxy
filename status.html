@@ -537,8 +537,8 @@
             const option = {
                 title: { text: '每日错误统计 (堆叠条形图)', left: 'center' },
                 tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
-                legend: { data: sortedErrorTypes, top: 'bottom' },
-                grid: { left: '3%', right: '4%', bottom: '10%', containLabel: true },
+                legend: { type: 'scroll', data: sortedErrorTypes, top: 'bottom' },
+                grid: { left: '3%', right: '4%', bottom: '15%', containLabel: true },
                 xAxis: [{ type: 'category', data: sortedDates }],
                 yAxis: [{ type: 'value' }],
                 series: series
@@ -619,13 +619,14 @@
                     }
                 },
                 legend: {
+                    type: 'scroll',
                     top: 'bottom'
                 },
                 series: [{
                     name: '模型',
                     type: 'pie',
-                    radius: '65%',
-                    center: ['50%', '55%'],
+                    radius: '60%',
+                    center: ['50%', '50%'],
                     data: pieData,
                     emphasis: {
                         itemStyle: {
