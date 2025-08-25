@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1416,7 +1417,25 @@ var statsHTML []byte // 用于缓存 status.html 的内容
 
 // handleStats 以JSON格式返回当前的API使用统计数据
 func handleStats(w http.ResponseWriter, r *http.Request) {
-	rows, err := db.Query("SELECT model_name, date, count, prompt_tokens, candidates_tokens, total_tokens, cost FROM usage_stats ORDER BY date, model_name")
+	daysStr := r.URL.Query().Get("days")
+	days, err := strconv.Atoi(daysStr)
+	if err != nil || days == 0 {
+		// A value of 0 or an invalid value means all time
+		days = 0
+	}
+
+	query := "SELECT model_name, date, count, prompt_tokens, candidates_tokens, total_tokens, cost FROM usage_stats"
+	var args []interface{}
+
+	if days > 0 {
+		// We want to include `days` number of days. e.g., if days=7, we want today + 6 previous days.
+		cutoffDate := time.Now().In(cstZone).AddDate(0, 0, -(days - 1)).Format("2006-01-02")
+		query += " WHERE date >= ?"
+		args = append(args, cutoffDate)
+	}
+	query += " ORDER BY date, model_name"
+
+	rows, err := db.Query(query, args...)
 	if err != nil {
 		log.Printf("从数据库查询统计数据时出错: %v", err)
 		http.Error(w, "无法查询统计数据", http.StatusInternalServerError)

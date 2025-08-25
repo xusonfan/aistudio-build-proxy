@@ -28,20 +28,29 @@
         #charts-wrapper { display: flex; flex-wrap: wrap; gap: 1em; margin-bottom: 1em; }
         .chart-container { flex: 1; min-width: 400px; height: 320px; background-color: #fff; box-shadow: 0 2px 5px rgba(0,0,0,0.1); border-radius: 8px; padding: 1em; }
         .stats-section { margin-top: 1.5em; }
-        label[for="date-range-selector"] { margin-right: 10px; font-weight: bold; color: #555; }
-        #date-range-selector {
-            padding: 8px 12px;
-            border: 1px solid #ddd;
-            border-radius: 4px;
-            background-color: #fff;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-            cursor: pointer;
-            font-size: 1em;
-            transition: border-color 0.2s;
+        .tabs {
+            display: flex;
+            gap: 5px;
+            border-bottom: 2px solid #ddd;
+            margin-bottom: 1em;
         }
-        #date-range-selector:focus {
-            outline: none;
-            border-color: #007bff;
+        .tab-button {
+            padding: 8px 16px;
+            cursor: pointer;
+            border: none;
+            background-color: transparent;
+            font-size: 1em;
+            color: #555;
+            border-bottom: 2px solid transparent;
+            transition: color 0.2s, border-color 0.2s;
+        }
+        .tab-button:hover {
+            color: #007bff;
+        }
+        .tab-button.active {
+            color: #007bff;
+            border-bottom-color: #007bff;
+            font-weight: bold;
         }
         #total-stats-container {
             display: flex;
@@ -101,13 +110,11 @@
     <div class="title-container">
         <h1>API 使用统计</h1>
         <div id="date-range-container">
-            <div>
-                <label for="date-range-selector">时间范围:</label>
-                <select id="date-range-selector">
-                    <option value="7" selected>最近 7 天</option>
-                    <option value="30">最近 30 天</option>
-                    <option value="0">所有时间</option>
-                </select>
+            <div class="tabs" id="date-range-tabs">
+                <button class="tab-button active" data-days="7">周视图</button>
+                <button class="tab-button" data-days="30">月视图</button>
+                <button class="tab-button" data-days="365">年视图</button>
+                <button class="tab-button" data-days="0">所有时间</button>
             </div>
             <p style="margin: 0.5em 0 0 0; font-size: 0.8em; color: #666;">数据每 5 秒自动刷新</p>
         </div>
@@ -205,13 +212,15 @@
         const myErrorChart = echarts.init(errorChartDom);
         const myTokenChart = echarts.init(tokenChartDom);
         const myDailyCostPieChart = echarts.init(dailyCostPieChartDom);
-        const dateRangeSelector = document.getElementById('date-range-selector');
+        const dateRangeTabs = document.getElementById('date-range-tabs');
+
+        let currentDays = '7'; // 默认周视图
 
         async function fetchData() {
             // Fetch stats and connections in parallel
             try {
                 const [statsResponse, connsResponse, todayCostResponse] = await Promise.all([
-                    fetch('/stats'),
+                    fetch(`/stats?days=${currentDays}`),
                     fetch('/connections'),
                     fetch('/stats/today_cost')
                 ]);
@@ -254,27 +263,16 @@
         }
 
         function processAndFilterData(rawData) {
-            const days = parseInt(dateRangeSelector.value, 10);
+            // 数据现在由后端预先过滤。
+            // 我们只需要将模型数据与错误数据分开。
             const modelData = {};
             const errorData = {};
 
-            const cutoffDate = new Date();
-            if (days !== 0) {
-                cutoffDate.setDate(cutoffDate.getDate() - days);
-                cutoffDate.setHours(0, 0, 0, 0);
-            }
-
             for (const key in rawData) {
-                const parts = key.split('-');
-                const dateStr = parts.slice(-3).join('-');
-                const entryDate = new Date(dateStr);
-
-                if (days === 0 || entryDate >= cutoffDate) {
-                    if (key.startsWith('error-status-')) {
-                        errorData[key] = rawData[key].count;
-                    } else {
-                        modelData[key] = rawData[key];
-                    }
+                if (key.startsWith('error-status-')) {
+                    errorData[key] = rawData[key].count;
+                } else {
+                    modelData[key] = rawData[key];
                 }
             }
             return { modelData, errorData };
@@ -659,7 +657,21 @@
             myDailyCostPieChart.showLoading('default', { text: '正在加载数据...' });
             fetchData();
             setInterval(fetchData, 5000);
-            dateRangeSelector.addEventListener('change', fetchData);
+
+            dateRangeTabs.addEventListener('click', (event) => {
+                if (event.target.classList.contains('tab-button')) {
+                    // 移除所有按钮的 active class
+                    dateRangeTabs.querySelectorAll('.tab-button').forEach(button => {
+                        button.classList.remove('active');
+                    });
+                    // 给点击的按钮添加 active class
+                    event.target.classList.add('active');
+                    // 更新当前天数并重新获取数据
+                    currentDays = event.target.getAttribute('data-days');
+                    fetchData();
+                }
+            });
+
             document.getElementById('unit-toggle-btn').addEventListener('click', () => {
                 currentUnit = currentUnit === 'K' ? 'M' : 'K';
                 document.getElementById('unit-toggle-btn').textContent = `单位: ${currentUnit}`;
