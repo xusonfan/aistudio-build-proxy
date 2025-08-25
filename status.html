@@ -100,6 +100,41 @@
            border-radius: 4px;
            cursor: pointer;
        }
+        .settings-toggle {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            padding: 4px 8px;
+            font-size: 1.2em;
+            line-height: 1;
+            background-color: transparent;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            z-index: 10;
+        }
+        .settings-toggle:hover {
+            background-color: #e9ecef;
+        }
+        .exchange-rate-setter {
+            position: absolute;
+            top: 40px;
+            left: 10px;
+            font-size: 0.8em;
+            background-color: #fff;
+            padding: 8px;
+            border-radius: 4px;
+            border: 1px solid #ddd;
+            display: none; /* 初始隐藏 */
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+            z-index: 10;
+        }
+        .exchange-rate-setter input {
+            width: 50px;
+            border: 1px solid #ccc;
+            border-radius: 3px;
+            padding: 2px;
+        }
         .status-healthy { color: #28a745; font-weight: bold; }
         .status-unhealthy { color: #dc3545; font-weight: bold; }
     </style>
@@ -139,9 +174,14 @@
             <button id="unit-toggle-btn" class="unit-toggle">单位: M</button>
         </div>
         <div class="stat-card">
+            <button id="exchange-rate-settings-btn" class="settings-toggle">⚙️</button>
             <h3 id="total-cost-title">总费用 (CNY)</h3>
             <p id="total-cost">$0.00</p>
             <button id="currency-toggle-btn" class="currency-toggle">货币: CNY</button>
+            <div id="exchange-rate-container" class="exchange-rate-setter">
+                <label for="exchange-rate-input">汇率:</label>
+                <input type="number" id="exchange-rate-input" step="0.01">
+            </div>
         </div>
     </div>
 
@@ -279,8 +319,8 @@
         }
 
         let currentUnit = 'M';
-        // 汇率可以根据需要动态获取，这里使用静态值
-        const USD_TO_CNY_RATE = 7.25;
+        // 汇率设置
+        let USD_TO_CNY_RATE = parseFloat(localStorage.getItem('USD_TO_CNY_RATE')) || 7.25;
         let currentCurrency = 'CNY';
         let lastModelData = {};
 
@@ -677,16 +717,71 @@
                 document.getElementById('unit-toggle-btn').textContent = `单位: ${currentUnit}`;
                 updateTotalStats(lastModelData); // Re-render stats with the new unit
             });
-           document.getElementById('currency-toggle-btn').addEventListener('click', () => {
+            const currencyToggleBtn = document.getElementById('currency-toggle-btn');
+            const exchangeRateContainer = document.getElementById('exchange-rate-container');
+            const exchangeRateInput = document.getElementById('exchange-rate-input');
+            const exchangeRateSettingsBtn = document.getElementById('exchange-rate-settings-btn');
+
+            // 初始化汇率输入框
+            exchangeRateInput.value = USD_TO_CNY_RATE;
+
+            function updateCurrencyDisplay() {
+                const isCNY = currentCurrency === 'CNY';
+                currencyToggleBtn.textContent = `货币: ${currentCurrency}`;
+                document.getElementById('total-cost-title').textContent = `总费用 (${currentCurrency})`;
+                document.getElementById('cost-header').textContent = `费用 (${currentCurrency})`;
+                
+                // 控制设置按钮和汇率设置框的可见性
+                exchangeRateSettingsBtn.style.display = isCNY ? 'block' : 'none';
+                if (!isCNY) {
+                    exchangeRateContainer.style.display = 'none';
+                }
+
+                // 使用最新的数据重新渲染统计信息和表格
+                if (typeof updateTotalStats === 'function' && typeof lastModelData !== 'undefined') {
+                    updateTotalStats(lastModelData);
+                }
+                if (typeof updateModelTable === 'function' && typeof lastModelData !== 'undefined') {
+                    updateModelTable(lastModelData);
+                }
+                // 重新获取并绘制每日费用饼图
+                fetch('/stats/today_cost').then(res => res.json()).then(updateDailyCostPieChart);
+            }
+
+            // 切换货币
+            currencyToggleBtn.addEventListener('click', () => {
                currentCurrency = currentCurrency === 'USD' ? 'CNY' : 'USD';
-               document.getElementById('currency-toggle-btn').textContent = `货币: ${currentCurrency}`;
-               document.getElementById('total-cost-title').textContent = `总费用 (${currentCurrency})`;
-               document.getElementById('cost-header').textContent = `费用 (${currentCurrency})`;
-               updateTotalStats(lastModelData); // Re-render stats with the new currency
-               updateModelTable(lastModelData); // Re-render table with the new currency
-               // Refetch and redraw the daily cost pie chart as it depends on currency
-               fetch('/stats/today_cost').then(res => res.json()).then(updateDailyCostPieChart);
-           });
+               updateCurrencyDisplay();
+            });
+
+            // 切换汇率设置框的显示
+            exchangeRateSettingsBtn.addEventListener('click', (event) => {
+                event.stopPropagation();
+                const isVisible = exchangeRateContainer.style.display === 'block';
+                exchangeRateContainer.style.display = isVisible ? 'none' : 'block';
+            });
+
+            // 点击页面其他地方隐藏汇率设置框
+            document.addEventListener('click', (event) => {
+                if (!exchangeRateContainer.contains(event.target) && event.target !== exchangeRateSettingsBtn) {
+                    exchangeRateContainer.style.display = 'none';
+                }
+            });
+
+            // 更新汇率
+            exchangeRateInput.addEventListener('change', () => {
+                const newRate = parseFloat(exchangeRateInput.value);
+                if (!isNaN(newRate) && newRate > 0) {
+                    USD_TO_CNY_RATE = newRate;
+                    localStorage.setItem('USD_TO_CNY_RATE', USD_TO_CNY_RATE);
+                    updateCurrencyDisplay(); // 使用新汇率重新渲染所有相关组件
+                } else {
+                    exchangeRateInput.value = USD_TO_CNY_RATE;
+                }
+            });
+
+            // 初始加载时更新一次显示状态
+            updateCurrencyDisplay();
        }
 
         initCharts();
