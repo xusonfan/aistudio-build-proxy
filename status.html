@@ -592,7 +592,7 @@
         });
 
         function updateDailyCostPieChart(data) {
-            const pieData = data.map(item => ({
+            const pieData = (data || []).map(item => ({
                 name: item.model_name,
                 value: item.cost
             }));
