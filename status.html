@@ -450,8 +450,8 @@
             const option = {
                 title: { text: '每日模型调用量 (堆叠条形图)', left: 'center' },
                 tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
-                legend: { data: sortedModels, top: 'bottom' },
-                grid: { left: '3%', right: '4%', bottom: '10%', containLabel: true },
+                legend: { type: 'scroll', data: sortedModels, top: 'bottom' },
+                grid: { left: '3%', right: '4%', bottom: '15%', containLabel: true },
                 xAxis: [{ type: 'category', data: sortedDates }],
                 yAxis: [{ type: 'value' }],
                 series: series
@@ -481,7 +481,7 @@
             const option = {
                 title: { text: '模型总调用量占比 (饼图)', left: 'center' },
                 tooltip: { trigger: 'item', formatter: '{a} <br/>{b} : {c} ({d}%)' },
-                legend: { top: 'bottom', data: Object.keys(modelTotals) },
+                legend: { type: 'scroll', top: 'bottom', data: Object.keys(modelTotals) },
                 series: [
                     {
                         name: '模型',
@@ -675,8 +675,8 @@
             const option = {
                 title: { text: '每日 Token 使用量 (堆叠条形图)', left: 'center' },
                 tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
-                legend: { data: sortedModels, top: 'bottom' },
-                grid: { left: '3%', right: '4%', bottom: '10%', containLabel: true },
+                legend: { type: 'scroll', data: sortedModels, top: 'bottom' },
+                grid: { left: '3%', right: '4%', bottom: '15%', containLabel: true },
                 xAxis: [{ type: 'category', data: sortedDates }],
                 yAxis: [{ type: 'value' }],
                 series: series
