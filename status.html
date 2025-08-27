@@ -137,6 +137,21 @@
         }
         .status-healthy { color: #28a745; font-weight: bold; }
         .status-unhealthy { color: #dc3545; font-weight: bold; }
+        .toggle-btn {
+            font-size: 0.7em;
+            padding: 2px 8px;
+            margin-left: 10px;
+            cursor: pointer;
+            border: 1px solid #ddd;
+            background-color: #f0f0f0;
+            border-radius: 4px;
+        }
+        .stats-section h2 {
+            cursor: pointer;
+        }
+        .stats-section table tbody tr.hidden-row {
+            display: none;
+        }
     </style>
     <!-- 引入 ECharts -->
     <script src="echarts.min.js"></script>
@@ -196,7 +211,7 @@
     </div>
 
     <div class="stats-section">
-        <h2>当前连接状态</h2>
+        <h2>当前连接状态 <button class="toggle-btn" data-table="connections-table" style="display: none;">显示全部</button></h2>
         <table id="connections-table">
             <thead>
                 <tr>
@@ -210,7 +225,7 @@
     </div>
 
     <div class="stats-section">
-        <h2>模型调用详细数据</h2>
+        <h2>模型调用详细数据 <button class="toggle-btn" data-table="stats-table" style="display: none;">显示全部</button></h2>
         <table id="stats-table">
             <thead>
                 <tr>
@@ -228,7 +243,7 @@
     </div>
 
     <div class="stats-section">
-        <h2>错误统计详细数据</h2>
+        <h2>错误统计详细数据 <button class="toggle-btn" data-table="error-stats-table" style="display: none;">显示全部</button></h2>
         <table id="error-stats-table">
             <thead>
                 <tr>
@@ -396,6 +411,7 @@
                     tableBody.appendChild(row);
                 });
             }
+            setupTableCollapsing('stats-table', 3);
         }
 
         function updateErrorTable(data) {
@@ -419,6 +435,7 @@
                     tableBody.appendChild(row);
                 });
             }
+            setupTableCollapsing('error-stats-table', 3);
         }
 
         function updateModelBarChart(data) {
@@ -581,6 +598,35 @@
                 `;
                 tableBody.appendChild(row);
             });
+            setupTableCollapsing('connections-table', 3);
+        }
+
+        function setupTableCollapsing(tableId, defaultVisibleRows = 3) {
+            const tableBody = document.querySelector(`#${tableId} tbody`);
+            if (!tableBody) return;
+            const toggleBtn = document.querySelector(`.toggle-btn[data-table="${tableId}"]`);
+            const rows = tableBody.querySelectorAll('tr');
+
+            // Reset state by removing class from all rows
+            rows.forEach(row => row.classList.remove('hidden-row'));
+            if (!toggleBtn) return;
+
+            // If the only row is a "no data" row, hide the button.
+            if (rows.length === 1 && rows[0] && rows[0].querySelector('td')?.colSpan > 1) {
+                 toggleBtn.style.display = 'none';
+                 return;
+            }
+
+            if (rows.length > defaultVisibleRows) {
+                for (let i = 0; i < rows.length - defaultVisibleRows; i++) {
+                    rows[i].classList.add('hidden-row');
+                }
+                toggleBtn.textContent = `显示全部 (${rows.length} 条)`;
+                toggleBtn.dataset.state = 'collapsed';
+                toggleBtn.style.display = 'inline-block';
+            } else {
+                toggleBtn.style.display = 'none';
+            }
         }
         
         window.addEventListener('resize', () => {
@@ -783,6 +829,41 @@
 
             // 初始加载时更新一次显示状态
             updateCurrencyDisplay();
+
+            document.querySelectorAll('.stats-section h2').forEach(h2 => {
+                const button = h2.querySelector('.toggle-btn');
+                if (button) {
+                    // Make the H2 clickable to toggle, but not the button itself to avoid double-firing
+                    h2.addEventListener('click', (event) => {
+                        if (event.target.tagName.toLowerCase() !== 'button') {
+                           button.click();
+                        }
+                    });
+
+                    button.addEventListener('click', () => {
+                        const tableId = button.dataset.table;
+                        const tableBody = document.querySelector(`#${tableId} tbody`);
+                        if (!tableBody) return;
+                        const rows = tableBody.querySelectorAll('tr');
+                        const isCollapsed = button.dataset.state === 'collapsed';
+
+                        if (isCollapsed) {
+                            rows.forEach(row => row.classList.remove('hidden-row'));
+                            button.textContent = '折叠';
+                            button.dataset.state = 'expanded';
+                        } else {
+                            // Only collapse if there are more rows than the default
+                            if (rows.length > 3) {
+                                for (let i = 0; i < rows.length - 3; i++) {
+                                    rows[i].classList.add('hidden-row');
+                                }
+                                button.textContent = `显示全部 (${rows.length} 条)`;
+                                button.dataset.state = 'collapsed';
+                            }
+                        }
+                    });
+                }
+            });
        }
 
         initCharts();
