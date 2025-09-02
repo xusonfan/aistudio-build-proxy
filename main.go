@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	_ "embed" // 空导入以解决 "imported and not used" 的编译错误
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,7 +11,6 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -711,15 +711,17 @@ func handleNativeGeminiProxy(w http.ResponseWriter, r *http.Request) {
 
 	// 提取模型名称但先不记录
 	var modelName string
-	parts := strings.Split(r.URL.Path, "/")
-	for i, part := range parts {
-		if part == "models" && i+1 < len(parts) {
-			modelAndAction := parts[i+1]
-			modelNameParts := strings.Split(modelAndAction, ":")
-			if len(modelNameParts) > 0 {
-				modelName = modelNameParts[0]
+	if r.Method == "POST" {
+		parts := strings.Split(r.URL.Path, "/")
+		for i, part := range parts {
+			if part == "models" && i+1 < len(parts) {
+				modelAndAction := parts[i+1]
+				modelNameParts := strings.Split(modelAndAction, ":")
+				if len(modelNameParts) > 0 {
+					modelName = modelNameParts[0]
+				}
+				break // 找到就退出
 			}
-			break // 找到就退出
 		}
 	}
 
@@ -1185,7 +1187,6 @@ func handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 只有成功时才记录
-	recordUsage("models-list", nil) // 使用一个固定的名称来记录模型列表的调用
 
 	// Handle non-streaming response
 	var geminiResp GeminiModelListResponse
@@ -1413,7 +1414,11 @@ func handleOpenAIProxy(w http.ResponseWriter, r *http.Request) {
 
 // --- API统计与前端展示 ---
 
-var statsHTML []byte // 用于缓存 status.html 的内容
+//go:embed status.html
+var statsHTML []byte
+
+//go:embed echarts.min.js
+var echartsJS []byte
 
 // handleStats 以JSON格式返回当前的API使用统计数据
 func handleStats(w http.ResponseWriter, r *http.Request) {
@@ -1546,12 +1551,7 @@ func handleTodayCostStats(w http.ResponseWriter, r *http.Request) {
 // --- 主函数 ---
 
 func main() {
-	// 在程序启动时加载一次HTML文件
-	var err error
-	statsHTML, err = os.ReadFile("status.html")
-	if err != nil {
-		log.Fatalf("无法读取 status.html: %v", err)
-	}
+	// HTML和JS文件已通过 "embed" 包在编译时嵌入
 
 	// 初始化数据库
 	initDB()
@@ -1585,17 +1585,18 @@ func main() {
 	mux.HandleFunc("/connections", handleConnections)
 	mux.HandleFunc("/stats/today_cost", handleTodayCostStats)
 	// 根路由和静态文件服务
-	// 创建一个文件服务器，为当前目录下的文件提供服务
-	fs := http.FileServer(http.Dir("."))
+	// 根路由和静态文件服务 (从嵌入的文件)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// 如果请求的是根路径，我们专门提供 status.html
-		if r.URL.Path == "/" {
+		switch r.URL.Path {
+		case "/":
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.Write(statsHTML)
-			return
+		case "/echarts.min.js":
+			w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+			w.Write(echartsJS)
+		default:
+			http.NotFound(w, r)
 		}
-		// 对于所有其他路径 (例如 /echarts.min.js), 让文件服务器来处理
-		fs.ServeHTTP(w, r)
 	})
 
 	// 将 CORS 中间件应用到所有 HTTP 路由
