@@ -11,6 +11,8 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -1009,6 +1011,25 @@ func authenticateAndGetGoogleKey(r *http.Request) (userID, googleAPIKey string, 
 	return "user-1", clientAPIKey, nil
 }
 
+// openBrowser 尝试在默认浏览器中打开指定的URL
+func openBrowser(url string) {
+	var err error
+	switch runtime.GOOS {
+	case "linux":
+		err = exec.Command("xdg-open", url).Start()
+	case "windows":
+		err = exec.Command("cmd", "/c", "start", url).Start()
+	case "darwin":
+		err = exec.Command("open", url).Start()
+	default:
+		err = fmt.Errorf("unsupported platform")
+	}
+	if err != nil {
+		// 打印错误而不是致命错误，因为这只是一个辅助功能
+		log.Printf("无法自动打开浏览器, 请手动访问: %s\n错误: %v", url, err)
+	}
+}
+
 // --- CORS 中间件 ---
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1605,6 +1626,9 @@ func main() {
 	log.Printf("Starting server on %s", proxyListenAddr)
 	log.Printf("WebSocket endpoint available at ws://%s%s", proxyListenAddr, wsPath)
 	log.Printf("HTTP proxy available at http://%s/", proxyListenAddr)
+	log.Printf("Status page available at http://localhost%s/", proxyListenAddr)
+
+	openBrowser("http://localhost" + proxyListenAddr)
 
 	if err := http.ListenAndServe(proxyListenAddr, handler); err != nil {
 		log.Fatalf("Could not start server: %s\n", err)
