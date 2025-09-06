@@ -66,6 +66,7 @@
             border-radius: 8px;
             box-shadow: 0 2px 5px rgba(0,0,0,0.1);
             flex: 1;
+            min-width: 180px; /* 为卡片设置最小宽度以改善换行表现 */
             position: relative; /* Make stat-card a positioning context */
         }
         .stat-card h3 {
@@ -205,9 +206,10 @@
     <div id="charts-wrapper">
         <div id="bar-chart-container" class="chart-container"></div>
         <div id="pie-chart-container" class="chart-container"></div>
-        <div id="error-chart-container" class="chart-container"></div>
+        <div id="daily-cost-trend-chart-container" class="chart-container"></div>
         <div id="token-chart-container" class="chart-container"></div>
         <div id="daily-cost-pie-chart-container" class="chart-container"></div>
+        <div id="error-chart-container" class="chart-container"></div>
     </div>
 
     <div class="stats-section">
@@ -262,11 +264,13 @@
         const errorChartDom = document.getElementById('error-chart-container');
         const tokenChartDom = document.getElementById('token-chart-container');
         const dailyCostPieChartDom = document.getElementById('daily-cost-pie-chart-container');
+        const dailyCostTrendChartDom = document.getElementById('daily-cost-trend-chart-container');
         const myBarChart = echarts.init(barChartDom);
         const myPieChart = echarts.init(pieChartDom);
         const myErrorChart = echarts.init(errorChartDom);
         const myTokenChart = echarts.init(tokenChartDom);
         const myDailyCostPieChart = echarts.init(dailyCostPieChartDom);
+        const myDailyCostTrendChart = echarts.init(dailyCostTrendChartDom);
         const dateRangeTabs = document.getElementById('date-range-tabs');
 
         let currentDays = '7'; // 默认周视图
@@ -274,19 +278,22 @@
         async function fetchData() {
             // Fetch stats and connections in parallel
             try {
-                const [statsResponse, connsResponse, todayCostResponse] = await Promise.all([
+                const [statsResponse, connsResponse, todayCostResponse, dailyCostTrendResponse] = await Promise.all([
                     fetch(`/stats?days=${currentDays}`),
                     fetch('/connections'),
-                    fetch('/stats/today_cost')
+                    fetch('/stats/today_cost'),
+                    fetch(`/stats/daily_cost_trend?days=${currentDays}`)
                 ]);
 
                 if (!statsResponse.ok) throw new Error('Stats network response was not ok');
                 if (!connsResponse.ok) throw new Error('Connections network response was not ok');
                 if (!todayCostResponse.ok) throw new Error('Today cost network response was not ok');
+                if (!dailyCostTrendResponse.ok) throw new Error('Daily cost trend network response was not ok');
 
                 const rawData = await statsResponse.json();
                 const connsData = await connsResponse.json();
                 const todayCostData = await todayCostResponse.json();
+                const dailyCostTrendData = await dailyCostTrendResponse.json();
 
                 // Process and update stats
                 const { modelData, errorData } = processAndFilterData(rawData);
@@ -298,6 +305,7 @@
                 updateErrorBarChart(errorData);
                 updateTokenBarChart(modelData);
                 updateDailyCostPieChart(todayCostData);
+                updateDailyCostTrendChart(dailyCostTrendData);
 
                 // Update connections table
                 updateConnectionsTable(connsData);
@@ -314,6 +322,7 @@
                 myErrorChart.showLoading('default', { text: '加载数据失败' });
                 myTokenChart.showLoading('default', { text: '加载数据失败' });
                 myDailyCostPieChart.showLoading('default', { text: '加载数据失败' });
+                myDailyCostTrendChart.showLoading('default', { text: '加载数据失败' });
             }
         }
 
@@ -635,6 +644,7 @@
             myErrorChart.resize();
             myTokenChart.resize();
             myDailyCostPieChart.resize();
+            myDailyCostTrendChart.resize();
         });
 
         function updateDailyCostPieChart(data) {
@@ -736,12 +746,63 @@
             }
         }
         
+        function updateDailyCostTrendChart(data) {
+            const dates = data.map(item => item.date);
+            const costs = data.map(item => item.cost);
+
+            const option = {
+                title: { text: '每日费用趋势 (折线图)', left: 'center' },
+                tooltip: {
+                    trigger: 'axis',
+                    formatter: (params) => {
+                        // 对于 'axis' 类型的提示框，params 是一个包含各个系列数据的数组
+                        if (!params || params.length === 0) {
+                            return '';
+                        }
+                    const param = params[0]; // 我们只有一个系列，所以取第一个
+                        const date = param.name;      // X轴的值 (日期)
+                        const cost = param.value;      // Y轴的值 (费用)
+                        const displayCost = currentCurrency === 'CNY'
+                            ? `¥${(cost * USD_TO_CNY_RATE).toFixed(4)}`
+                            : `$${cost.toFixed(4)}`;
+                        // 使用 param.seriesName 可以使提示更明确
+                        return `${date}<br/>${param.seriesName}: ${displayCost}`;
+                    }
+                },
+                grid: { left: '3%', right: '4%', bottom: '10%', containLabel: true },
+                xAxis: { type: 'category', boundaryGap: false, data: dates },
+                yAxis: {
+                    type: 'value',
+                    axisLabel: {
+                        formatter: (value) => {
+                            return currentCurrency === 'CNY' ? `¥${(value * USD_TO_CNY_RATE).toFixed(2)}` : `$${value.toFixed(2)}`;
+                        }
+                    }
+                },
+                series: [{
+                    name: '费用',
+                    type: 'line',
+                    data: costs,
+                    smooth: true,
+                    areaStyle: {}
+                }]
+            };
+
+            if (data.length === 0) {
+                myDailyCostTrendChart.showLoading('default', { text: '暂无数据' });
+            } else {
+                myDailyCostTrendChart.hideLoading();
+                myDailyCostTrendChart.setOption(option, true);
+            }
+        }
+
         function initCharts() {
             myBarChart.showLoading('default', { text: '正在加载数据...' });
             myPieChart.showLoading('default', { text: '正在加载数据...' });
             myErrorChart.showLoading('default', { text: '正在加载数据...' });
             myTokenChart.showLoading('default', { text: '正在加载数据...' });
             myDailyCostPieChart.showLoading('default', { text: '正在加载数据...' });
+            myDailyCostTrendChart.showLoading('default', { text: '正在加载数据...' });
             fetchData();
             setInterval(fetchData, 5000);
 

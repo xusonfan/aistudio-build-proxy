@@ -1535,6 +1535,12 @@ type DailyCostStat struct {
 	Cost      float64 `json:"cost"`
 }
 
+// DailyCostTrendPoint holds aggregated cost for a single day.
+type DailyCostTrendPoint struct {
+	Date string  `json:"date"`
+	Cost float64 `json:"cost"`
+}
+
 // handleTodayCostStats 以JSON格式返回当天各模型的费用消耗
 func handleTodayCostStats(w http.ResponseWriter, r *http.Request) {
 	date := time.Now().In(cstZone).Format("2006-01-02")
@@ -1566,6 +1572,57 @@ func handleTodayCostStats(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(stats); err != nil {
 		log.Printf("序列化今日费用统计数据时出错: %v", err)
 		http.Error(w, "无法序列化今日费用统计数据", http.StatusInternalServerError)
+	}
+}
+
+// handleDailyCostTrend 返回指定周期内每一天的总费用
+func handleDailyCostTrend(w http.ResponseWriter, r *http.Request) {
+	daysStr := r.URL.Query().Get("days")
+	days, err := strconv.Atoi(daysStr)
+	if err != nil {
+		// 如果参数无效，则默认为0（所有时间）
+		days = 0
+	}
+
+	query := "SELECT date, SUM(cost) FROM usage_stats"
+	var args []interface{}
+
+	if days > 0 {
+		// 我们希望包含 `days` 天的数据。例如，如果 days=7，我们需要今天 + 过去6天。
+		cutoffDate := time.Now().In(cstZone).AddDate(0, 0, -(days - 1)).Format("2006-01-02")
+		query += " WHERE date >= ?"
+		args = append(args, cutoffDate)
+	}
+
+	query += " GROUP BY date ORDER BY date ASC"
+
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		log.Printf("从数据库查询每日费用趋势时出错: %v", err)
+		http.Error(w, "无法查询统计数据", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var trend []DailyCostTrendPoint
+	for rows.Next() {
+		var point DailyCostTrendPoint
+		if err := rows.Scan(&point.Date, &point.Cost); err != nil {
+			log.Printf("扫描每日费用趋势行时出错: %v", err)
+			continue
+		}
+		trend = append(trend, point)
+	}
+
+	if err := rows.Err(); err != nil {
+		log.Printf("遍历每日费用趋势行时出错: %v", err)
+		http.Error(w, "遍历统计数据时出错", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(trend); err != nil {
+		log.Printf("序列化每日费用趋势时出错: %v", err)
 	}
 }
 
@@ -1605,6 +1662,7 @@ func main() {
 	mux.HandleFunc("/stats", handleStats)
 	mux.HandleFunc("/connections", handleConnections)
 	mux.HandleFunc("/stats/today_cost", handleTodayCostStats)
+	mux.HandleFunc("/stats/daily_cost_trend", handleDailyCostTrend)
 	// 根路由和静态文件服务
 	// 根路由和静态文件服务 (从嵌入的文件)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
