@@ -618,7 +618,7 @@
             }
 
             if (rows.length > defaultVisibleRows) {
-                for (let i = 0; i < rows.length - defaultVisibleRows; i++) {
+                for (let i = defaultVisibleRows; i < rows.length; i++) {
                     rows[i].classList.add('hidden-row');
                 }
                 toggleBtn.textContent = `显示全部 (${rows.length} 条)`;
@@ -854,7 +854,7 @@
                         } else {
                             // Only collapse if there are more rows than the default
                             if (rows.length > 3) {
-                                for (let i = 0; i < rows.length - 3; i++) {
+                                for (let i = 3; i < rows.length; i++) {
                                     rows[i].classList.add('hidden-row');
                                 }
                                 button.textContent = `显示全部 (${rows.length} 条)`;
