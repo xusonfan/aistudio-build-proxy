@@ -40,6 +40,20 @@ const dbFilename = "usage_stats.db"
 
 var db *sql.DB
 
+// --- RPM Statistics ---
+var (
+	requestTimestamps      []time.Time
+	requestTimestampsMutex sync.Mutex
+)
+
+// recordRequest records a new request timestamp for RPM calculation.
+func recordRequest() {
+	requestTimestampsMutex.Lock()
+	defer requestTimestampsMutex.Unlock()
+	// Just append the new timestamp. Pruning is handled by the stats endpoint.
+	requestTimestamps = append(requestTimestamps, time.Now())
+}
+
 // UsageData holds statistics for a given key.
 type UsageData struct {
 	Count            int64   `json:"count"`
@@ -709,6 +723,7 @@ func forwardRequestToBrowser(w http.ResponseWriter, r *http.Request, userID stri
 
 // handleNativeGeminiProxy 处理原生的Gemini API请求
 func handleNativeGeminiProxy(w http.ResponseWriter, r *http.Request) {
+	recordRequest() // 记录请求用于RPM计算
 	log.Printf("Received native Gemini request: Method=%s, Path=%s, From=%s", r.Method, r.URL.Path, r.RemoteAddr)
 
 	// 提取模型名称但先不记录
@@ -1163,6 +1178,7 @@ func convertGeminiModelListToOpenAI(geminiResp *GeminiModelListResponse) map[str
 // --- HTTP Handlers for OpenAI Compatibility ---
 
 func handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
+	recordRequest() // 记录请求用于RPM计算
 	log.Println("Received OpenAI compatible models list request")
 
 	// --- Authenticate the request and get the key for Google ---
@@ -1224,6 +1240,7 @@ func handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleOpenAIProxy(w http.ResponseWriter, r *http.Request) {
+	recordRequest() // 记录请求用于RPM计算
 	log.Println("Received OpenAI compatible request")
 
 	var openAIReq OpenAIRequest
@@ -1626,6 +1643,30 @@ func handleDailyCostTrend(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleRPMStats returns the current requests per minute.
+func handleRPMStats(w http.ResponseWriter, r *http.Request) {
+	requestTimestampsMutex.Lock()
+	defer requestTimestampsMutex.Unlock()
+
+	now := time.Now()
+	oneMinuteAgo := now.Add(-1 * time.Minute)
+
+	// Prune timestamps older than one minute before calculating.
+	n := 0
+	for _, ts := range requestTimestamps {
+		if !ts.Before(oneMinuteAgo) {
+			requestTimestamps[n] = ts
+			n++
+		}
+	}
+	requestTimestamps = requestTimestamps[:n]
+
+	rpm := len(requestTimestamps)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]int{"rpm": rpm})
+}
+
 // --- 主函数 ---
 
 func main() {
@@ -1663,6 +1704,7 @@ func main() {
 	mux.HandleFunc("/connections", handleConnections)
 	mux.HandleFunc("/stats/today_cost", handleTodayCostStats)
 	mux.HandleFunc("/stats/daily_cost_trend", handleDailyCostTrend)
+	mux.HandleFunc("/stats/rpm", handleRPMStats)
 	// 根路由和静态文件服务
 	// 根路由和静态文件服务 (从嵌入的文件)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {

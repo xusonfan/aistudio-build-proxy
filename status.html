@@ -177,6 +177,10 @@
             <p id="total-calls">0</p>
         </div>
         <div class="stat-card">
+            <h3>实时 RPM</h3>
+            <p id="rpm-stat">0</p>
+        </div>
+        <div class="stat-card">
             <h3>总输入 Tokens</h3>
             <p id="total-prompt-tokens">0</p>
         </div>
@@ -278,22 +282,25 @@
         async function fetchData() {
             // Fetch stats and connections in parallel
             try {
-                const [statsResponse, connsResponse, todayCostResponse, dailyCostTrendResponse] = await Promise.all([
+                const [statsResponse, connsResponse, todayCostResponse, dailyCostTrendResponse, rpmResponse] = await Promise.all([
                     fetch(`/stats?days=${currentDays}`),
                     fetch('/connections'),
                     fetch('/stats/today_cost'),
-                    fetch(`/stats/daily_cost_trend?days=${currentDays}`)
+                    fetch(`/stats/daily_cost_trend?days=${currentDays}`),
+                    fetch('/stats/rpm')
                 ]);
 
                 if (!statsResponse.ok) throw new Error('Stats network response was not ok');
                 if (!connsResponse.ok) throw new Error('Connections network response was not ok');
                 if (!todayCostResponse.ok) throw new Error('Today cost network response was not ok');
                 if (!dailyCostTrendResponse.ok) throw new Error('Daily cost trend network response was not ok');
+                if (!rpmResponse.ok) throw new Error('RPM network response was not ok');
 
                 const rawData = await statsResponse.json();
                 const connsData = await connsResponse.json();
                 const todayCostData = await todayCostResponse.json();
                 const dailyCostTrendData = await dailyCostTrendResponse.json();
+                const rpmData = await rpmResponse.json();
 
                 // Process and update stats
                 const { modelData, errorData } = processAndFilterData(rawData);
@@ -309,6 +316,9 @@
 
                 // Update connections table
                 updateConnectionsTable(connsData);
+
+                // Update RPM stat
+                document.getElementById('rpm-stat').textContent = rpmData.rpm;
 
             } catch (error) {
                 console.error('获取数据时出错:', error);
