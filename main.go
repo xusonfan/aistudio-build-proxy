@@ -111,9 +111,11 @@ var pricing = map[string]ModelPricing{
 	}},
 
 	// --- Models with Flat Pricing ---
-	"gemini-pro":            {Tiers: []PriceTier{{Threshold: 0, InputCost: 1.25, OutputCost: 5.00}}}, // Assume same as 1.5 pro base
-	"gemini-2.5-flash":      {Tiers: []PriceTier{{Threshold: 0, InputCost: 0.30, OutputCost: 2.50}}},
-	"gemini-2.5-flash-lite": {Tiers: []PriceTier{{Threshold: 0, InputCost: 0.10, OutputCost: 0.40}}},
+	"gemini-pro":               {Tiers: []PriceTier{{Threshold: 0, InputCost: 1.25, OutputCost: 5.00}}}, // Assume same as 1.5 pro base
+	"gemini-2.5-flash":         {Tiers: []PriceTier{{Threshold: 0, InputCost: 0.30, OutputCost: 2.50}}},
+	"gemini-2.5-flash-lite":    {Tiers: []PriceTier{{Threshold: 0, InputCost: 0.10, OutputCost: 0.40}}},
+	"gemini-flash-latest":      {Tiers: []PriceTier{{Threshold: 0, InputCost: 0.30, OutputCost: 2.50}}},
+	"gemini-flash-lite-latest": {Tiers: []PriceTier{{Threshold: 0, InputCost: 0.10, OutputCost: 0.40}}},
 }
 
 // calculateCost 根据模型的定价层级计算请求成本
