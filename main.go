@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	_ "time/tzdata" // 嵌入时区数据库
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
