@@ -745,6 +745,14 @@ func handleNativeGeminiProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// 如果模型是 gemini-2.5-pro-preview-03-25, 则替换为 gemini-3-pro-preview
+	if modelName == "gemini-2.5-pro-preview-03-25" {
+		log.Printf("将模型 'gemini-2.5-pro-preview-03-25' 替换为 'gemini-3-pro-preview'")
+		// 同时更新URL路径和用于记录的模型名称
+		r.URL.Path = strings.Replace(r.URL.Path, "gemini-2.5-pro-preview-03-25", "gemini-3-pro-preview", 1)
+		modelName = "gemini-3-pro-preview"
+	}
+
 	// 1. 使用专门为原生Gemini请求设计的宽松认证
 	userID, err := authenticateNativeRequest(r)
 	if err != nil {
